@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Synopsys EDA tool outputs
+*.svf
+*.log
+*.txt
+!README*.txt
+alib-*/
+FM_INFO/
+WORK/
+default.svf
+command.log
+compile_*.log
+lc_*.log
+*_command.log
+formality.log
+
+# SLURM output files
+slurm-*.out
+slurm-*.err
+
+# Large data files (these should be stored separately)
+*.jsonl
+*.csv
+*.parquet
+sim_config.json
+
+# Temporary files
+*.tmp
+.temp*.tcl
+.temp*.txt
+
+# Compiled Rust artifacts
+fault_net_preprocessor/target/
+data_preprocessor/target/
+Cargo.lock
+
+# Documentation deliverables (internal)
+deliverables/
+
+# Logs directory contents (keep directory structure)
+logs/*.out
+logs/*.err
+logs/*.log
+
+# Library files (too large, users should obtain separately)
+# lib/
+
+# Build artifacts
+*.o
+*.a
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+.coverage
+htmlcov/
