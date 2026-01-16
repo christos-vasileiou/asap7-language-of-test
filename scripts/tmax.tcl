@@ -269,6 +269,12 @@ if {$is_seq} {
   set_atpg -nofull_seq_atpg -random_fill
 }
 
+# whether the circuit is sequential or not
+set is_sequential_output_file [file join $design_output_dir "is_sequential.txt"]
+set fh [open $is_sequential_output_file "w"]
+puts $fh $is_sequential
+close $fh
+
 # Clean up. Go to the initial state.
 set_drc -nofile
 drc -force >> .temp.txt

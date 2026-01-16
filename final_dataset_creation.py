@@ -563,7 +563,7 @@ if __name__ == '__main__':
     return DATA_PATH / DATASET / f"dataset.{suffix}.csv"
 
   def _default_tetramax_folder():
-    return DATA_PATH / f"out.{suffix}"
+    return DATA_PATH / DATASET / f"out.{suffix}"
 
   def _default_load_model():
     return os.environ["MODEL"]
@@ -678,7 +678,6 @@ if __name__ == '__main__':
     with open(args.export_config, 'w') as f:
       json.dump(config_dump, f, indent=2)
     print(f"Configuration exported to {args.export_config}")
-    exit(0)
   
   dataset = args.csv_dataset
   tetramax_folder = args.tetramax_folder
@@ -759,24 +758,24 @@ if __name__ == '__main__':
       for col in schema.names:
         if col not in df_chunk.columns:
           df_chunk[col] = None
-
+          
       # Convert dicts to JSON strings for map columns
       for col in ['input_vector', 'expected_output']:
         if col in df_chunk.columns:
           df_chunk[col] = df_chunk[col].apply(lambda x: json.dumps(x) if x is not None else None)
-      print(f"Processing chunk... {i}")
+          
       try:
         table = pa.Table.from_pandas(df_chunk, schema=schema)
       except Exception as e:
         print(f"Error converting chunk to table: {e}")
         continue
-
+      
       if writer is None:
         shard_path = output_shards_dir / f"data-{shard_idx:05d}.parquet"
         writer = pq.ParquetWriter(shard_path, schema)
       writer.write_table(table)
       rows_in_current_shard += len(df_chunk)
-
+      
       if rows_in_current_shard >= ROWS_PER_SHARD:
         writer.close()
         writer = None

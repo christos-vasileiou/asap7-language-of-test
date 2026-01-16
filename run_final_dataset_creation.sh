@@ -22,4 +22,4 @@ export HF_USERNAME="chrivasileiou"
 export DATASET_HF_REPO_NAME="asap7-language-of-test"
 
 # Run the script
-python final_dataset_creation.py --export_config sim_config.json
+python final_dataset_creation.py --export_config sim_config.json 2>&1

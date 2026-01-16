@@ -80,7 +80,7 @@ def main(argv: List[str]) -> int:
 
     _LIB_LIST = []
     for cat in CATEGORIES:
-        # Gather all .v files that contain the triplet somewhere
+        # Gather all .db files that contain the triplet somewhere
         cat_files = list(LIB_DIR.glob(f"*{cat}_{VARIANT}_{PVT}*.v"))
         if not cat_files:
             continue

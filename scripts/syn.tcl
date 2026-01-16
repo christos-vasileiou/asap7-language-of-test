@@ -80,6 +80,7 @@ if { [sizeof_collection $all_ports] > 0 } {
 
 # Create clocks for all found clock ports
 if { [llength $clock_ports] > 0 } {
+    # High enough value for a clock period
     set CLK_PERIOD 1000
     foreach clk_port $clock_ports {
         puts "Info: Creating clock on port: $clk_port"
