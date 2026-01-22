@@ -4,7 +4,6 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=192G
-#SBATCH --time=24:00:00
 #SBATCH --output=logs/final_dataset_creation_%j.log
 
 set -euo pipefail

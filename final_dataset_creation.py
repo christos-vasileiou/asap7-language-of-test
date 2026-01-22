@@ -15,13 +15,14 @@ from vars import (
 )
 from datasets import DatasetDict, Dataset
 from transformers import AutoTokenizer
-from random import randint
+import random
 from io import StringIO
 from functools import partial
 from tqdm import tqdm
 import argparse
 import multiprocessing as mp
 import subprocess
+import copy
 from utils import best_match
 from pathlib import Path
 from dataclasses import dataclass
@@ -295,14 +296,18 @@ class OptimizedNetlist:
       for out_p in out_ports:
         out_net = connections[out_p]
         input_map = {p: connections.get(p) for p in in_ports} # map port name to net name
-        self.instructions.append(('gate', gate_type, out_p, out_net, input_map))
+        self.instructions.append(('gate', gate_type, instance, out_p, out_net, input_map))
 
 def convert_string_to_dict(x, sep=':'):
   return {net.strip(): int(value.strip()) for net_value in x.split(',') for net, value in [net_value.split(sep)]}
 
 def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault, optimized_netlist, gate_func, return_rewards = False):
   """
+  Performs fault simulation comparing good machine vs bad machine (with stuck-at fault).
   
+  Also computes:
+  - fault_propagation_path: nets where the fault effect propagates forward toward outputs
+  - backtrack_fault_path: inputs that control the fault propagation (sensitizing inputs)
   """
   FAULT_VALUE = r"sa(\d)\s*(.*)"
   fault_value_re = re.compile(FAULT_VALUE)
@@ -314,15 +319,15 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
     import traceback; traceback.print_exc()
     return pd.DataFrame() # Or error
   
-  fault_path = [faulty_net]
+  # Fault propagation path from the injection point to the outputs
+  fault_propagation_path = [faulty_net] # injection point
+  
   if isinstance(input_nets_and_vector, str):
     input_nets_and_vector = convert_string_to_dict(input_nets_and_vector, sep=':' if ':' in input_nets_and_vector else '=')
   if isinstance(expected_output_nets_and_vector, str):
     expected_output_nets_and_vector = convert_string_to_dict(expected_output_nets_and_vector, sep=':' if ':' in expected_output_nets_and_vector else '=')
   _inputs = list(input_nets_and_vector.keys())
   _outputs = list(expected_output_nets_and_vector.keys())
-  
-  #TODO: Edit the function so that it can calculate and return rewards. 
   
   # Calculate rewards if input and output vectors have the correct length
   if return_rewards:
@@ -337,6 +342,10 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
   
   bad_machine = input_nets_and_vector.copy()
   bad_machine.update({faulty_net: faulty_value})
+  
+  # Dependency graph: maps each net to the set of nets it directly depends on
+  # Used for backtracing from fault propagation path to controlling inputs
+  net_dependencies = {}
   
   # Helper to resolve value
   def resolve(machine, val, max_depth=20):
@@ -355,7 +364,7 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
       if visited > max_depth: break 
     return curr
   
-  # Pass 1: Evaluate instructions
+  # Pass 1: Evaluate instructions and build dependency graph
   for instr in optimized_netlist.instructions:
     typ = instr[0]
     
@@ -363,9 +372,12 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
       _, net, val = instr
       if net not in good_machine: good_machine[net] = val
       
+      # No dependencies for constant assignments
+      net_dependencies[net] = set()
+      
       # Bad Machine
       # If net is fault path (i.e. it IS the faulty net), we don't overwrite it with the assign
-      if net in fault_path:
+      if net in fault_propagation_path:
         pass
       else:
         if net not in bad_machine: bad_machine[net] = val
@@ -373,26 +385,40 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
     elif typ == 'assign_net':
       _, net, src = instr
       
+      # Track dependency: net depends on src
+      if not (isinstance(src, str) and src.isdigit()):
+        net_dependencies[net] = {src}
+      else:
+        net_dependencies[net] = set()
+      
       # Good Machine Update
       src_val_gm = resolve(good_machine, src)
       good_machine[net] = src_val_gm
       
       # Bad Machine Update
-      if net in fault_path:
+      if net in fault_propagation_path:
         continue # Already stuck
       
       src_val_bm = resolve(bad_machine, src)
       bad_machine[net] = src_val_bm
       
       # Fault Propagation
-      if src in fault_path:
-        fault_path.append(net)
+      if src in fault_propagation_path:
+        fault_propagation_path.append(net)
       
     elif typ == 'gate':
-      _, gate_type, out_port, out_net, input_map = instr
+      _, gate_type, instance, out_port, out_net, input_map = instr
       
       fn, sym_names = get_compiled_func(gate_type, out_port, gate_func)
       if not fn: continue
+      
+      # Track dependencies: out_net depends on all input nets of this gate
+      gate_input_nets = set()
+      for sym in sym_names:
+        p_net = input_map.get(sym)
+        if p_net is not None and not (isinstance(p_net, str) and p_net.isdigit()):
+          gate_input_nets.add(p_net)
+      net_dependencies[out_net] = gate_input_nets
       
       def eval_gate_inputs(machine):
         args = []
@@ -416,7 +442,7 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
         good_machine[out_net] = out_val
       
       # Bad Machine
-      if out_net not in fault_path:
+      if out_net not in fault_propagation_path:
         args_bm = eval_gate_inputs(bad_machine)
         if args_bm:
           out_val_bm = int(bool(fn(*args_bm)))
@@ -424,7 +450,7 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
           
           # Check propagation
           if args_gm and good_machine.get(out_net) != out_val_bm:
-            fault_path.append(out_net)
+            fault_propagation_path.append(out_net)
   
   # Final Cleanup Loops (resolve any remaining aliases)
   def cleanup(machine):
@@ -451,19 +477,84 @@ def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault
   bad_keys_to_remove = [net for net in bad_machine.keys() if isinstance(net, int) or (isinstance(net, str) and net.isdigit())]
   for net in bad_keys_to_remove: bad_machine.pop(net)
   
+  # ============================================================
+  # Backtracing: Find the inputs that control fault propagation
+  # ============================================================
+  # We trace backwards from nets in the fault_propagation_path to find
+  # all the primary inputs that affect whether the fault propagates.
+  # These are the "sensitizing inputs" that must have specific values
+  # for the fault effect to be observable at the outputs.
+  
+  def compute_backtrack_path(propagation_path, net_deps, primary_inputs):
+    """
+    Trace backwards from the fault propagation path to find controlling inputs.
+    
+    For each net on the fault propagation path, we recursively find all nets it depends on,
+    continuing until we reach primary inputs. The result is the set of primary inputs
+    that control the fault propagation (sensitizing inputs).
+    
+    Args:
+      propagation_path: List of nets where fault propagates (forward path)
+      net_deps: Dictionary mapping net -> set of nets it depends on
+      primary_inputs: Set of primary input net names
+    
+    Returns:
+      List of primary inputs that control the fault propagation
+    """
+    backtrack_inputs = set()
+    visited = set()
+    
+    # Start from all nets on the propagation path
+    to_visit = set(propagation_path)
+    
+    while to_visit:
+      net = to_visit.pop()
+      if net in visited:
+        continue
+      visited.add(net)
+      
+      # If this is a primary input, add to backtrack result
+      if net in primary_inputs:
+        backtrack_inputs.add(net)
+      # Otherwise, add its dependencies to visit
+      elif net in net_deps:
+        to_visit.update(net_deps[net])
+        backtrack_inputs.update(net_deps[net])
+    return list(backtrack_inputs)
+  
+  _inputs_set = set(_inputs)
+  backtrack_fault_path = compute_backtrack_path(fault_propagation_path, net_dependencies, _inputs_set)
+  
   simulation = pd.concat([pd.Series(good_machine), pd.Series(bad_machine)], axis=1)
   simulation[2] = simulation.index.isin(_inputs)
   simulation[3] = simulation.index.isin(_outputs)
-  simulation[4] = simulation.index.isin(fault_path)
-  
+  simulation[4] = simulation.index.isin(fault_propagation_path)
+  simulation[5] = simulation.index.isin(backtrack_fault_path)
+
   simulation = float_cols_to_int_with_x(simulation)
-  simulation.columns = ["Good Machine", "Bad Machine", "PIs", "POs", "Fault Path"]
+  simulation.columns = ["Good Machine", "Bad Machine", "PIs", "POs", "Fault Propagation Path", "Backtrack Sensitizing Inputs"]
+  
+  priority = {
+    (True,  False): 0,
+    (False, False): 1,
+    (False, True):  2
+  }
+  simulation["Priority"] = simulation[["PIs", "POs"]].apply(tuple, axis=1).map(priority)
+  simulation = simulation.sort_values("Priority").drop(columns=["Priority"])
+  
   if return_rewards:
     return simulation, rewards
   return simulation
 
 
-def process(x, prompt_dict, optimized_netlist, module_name, tetramax_folder, gate_func):
+def process(x, base_prompt_dict, optimized_netlist, module_name, tetramax_folder, gate_func):
+  """
+  Process a single pattern row to generate test vector data for detected faults.
+  
+  NOTE: This function creates a FRESH dict for each result to avoid race conditions
+  when using multiprocessing. The base_prompt_dict is only used as a template and
+  is deep-copied for each output record.
+  """
   vector_idx, input_vector, expected_output = x.name, x[0], x[1]
   input_vector = ','.join(input_vector).split(',')
   expected_output = ','.join(expected_output).split(',')
@@ -481,10 +572,11 @@ def process(x, prompt_dict, optimized_netlist, module_name, tetramax_folder, gat
   detected_faults_per_vector_df = pd.read_csv(detected_file_path, sep=r'\s+', header=None).sort_values(1)
   # keep only the detected faults.
   detected_faults = detected_faults_per_vector_df[detected_faults_per_vector_df.loc[:, 1] == "DS"][[0, 2]]
-
+  
   contents = []
   for _, _fault in detected_faults.iterrows():
     fault = _fault.str.cat(sep=' ')
+    faulty_net = _fault.iloc[1]
     try:
       snapshot = fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault, optimized_netlist=optimized_netlist, gate_func=gate_func)
     except:
@@ -492,41 +584,112 @@ def process(x, prompt_dict, optimized_netlist, module_name, tetramax_folder, gat
       continue # Skip if sim fails
 
     # TetraMax and ATPG report faults that happen before the faulty net. 
-    detected_faults_in_fault_path = snapshot[snapshot["Fault Path"] == True].reset_index()
+    # Extract nets on the fault propagation path
+    detected_faults_in_fault_path = snapshot[snapshot["Fault Propagation Path"] == True]['Bad Machine'].reset_index()
     detected_faults_in_fault_path = detected_faults_in_fault_path[["Bad Machine", "index"]]
     detected_faults_in_fault_path_str = 'sa'+detected_faults_in_fault_path.astype(str).apply(' '.join, axis=1).str.cat(sep=', sa')
     
-    system_prompt = _system_prompts[randint(0, len(_system_prompts)-1)]
-    prompt_dict.update({'fault': fault, 'input_vector': input_nets_and_vector, 'expected_output': expected_output_nets_and_vector, 'snapshot': df_to_compact_markdown(snapshot[["Good Machine", "Bad Machine"]]), 'detected_faults': detected_faults_in_fault_path_str})
-    user_prompt = _training_prompts_faults_list[randint(0, len(_training_prompts_faults_list)-1)]
-    reasoning_content = _cot_assistant_response_faults_list[randint(0, len(_cot_assistant_response_faults_list)-1)]
-    answer_content = _answer_template[randint(0, len(_answer_template)-1)]
-    prompt_dict.update({
+    # Extract the backtrack sensitizing inputs that control fault propagation
+    sensitizing_inputs = snapshot[snapshot["Backtrack Sensitizing Inputs"] == True].index.tolist()
+    
+    # ============================================================
+    # Find gate types by parsing optimized_netlist.instructions
+    # ============================================================
+    # Get the set of nets on each path
+    fault_propagation_nets = set(detected_faults_in_fault_path["index"].tolist())
+    sensitizing_input_nets = set(sensitizing_inputs)
+    
+    # Find gates whose OUTPUT is on the fault propagation path
+    # These gates are responsible for propagating the fault effect forward
+    fault_propagation_gates = []
+    fault_propagation_nets = detected_faults_in_fault_path['index'].tolist()
+    for instr in optimized_netlist.instructions:
+      if instr[0] == 'gate':
+        _, gate_type, instance, out_port, out_net, input_map = instr
+        if out_net in fault_propagation_nets:
+          fault_propagation_gates.append(instance)
+    
+    # Find gates whose INPUTS include sensitizing inputs
+    # These gates are driven by the sensitizing inputs (backward dependency)
+    backtrack_gates = []
+    for instr in reversed(optimized_netlist.instructions):
+      if instr[0] == 'gate':
+        _, gate_type, instance, out_port, out_net, input_map = instr
+        # Check if any input net of this gate is a sensitizing input
+        gate_input_nets = set(input_map.values())
+        if gate_input_nets & sensitizing_input_nets:  # intersection
+          backtrack_gates.append(instance)
+    
+    # Format as comma-separated strings
+    fault_propagation_gates_str = ', '.join(fault_propagation_gates) if fault_propagation_gates else ''
+    fault_propagation_nets_str = ', '.join(fault_propagation_nets) if fault_propagation_nets else ''
+    backtrack_gates_str = ', '.join(backtrack_gates) if backtrack_gates else ''
+    backtrack_nets_str = ', '.join(sensitizing_input_nets) if sensitizing_input_nets else ''
+
+    # Create a FRESH deep copy for each result to avoid shared references
+    # This prevents race conditions when workers process data in parallel
+    result_dict = copy.deepcopy(base_prompt_dict)
+    
+    system_prompt = _system_prompts[random.randint(0, len(_system_prompts)-1)]
+    result_dict.update({
+      'fault': fault, 
+      # Deep copy the dicts to ensure no shared references between results
+      'input_vector': copy.deepcopy(input_nets_and_vector), 
+      'expected_output': copy.deepcopy(expected_output_nets_and_vector), 
+      'snapshot': df_to_compact_markdown(snapshot[["Good Machine", "Bad Machine"]]), 
+      'detected_faults': detected_faults_in_fault_path_str,
+      'fault_propagation_gates': fault_propagation_gates_str,  # Gates whose outputs are on propagation path
+      'fault_propagation_nets': fault_propagation_nets_str,  # Nets on the fault propagation path
+      'backtrack_gates': backtrack_gates_str,  # Gates whose inputs include sensitizing inputs
+      'backtrack_nets': backtrack_nets_str,  # Nets on the backtrack path
+    })
+    user_prompt = _training_prompts_faults_list[random.randint(0, len(_training_prompts_faults_list)-1)]
+    reasoning_content = _cot_assistant_response_faults_list[random.randint(0, len(_cot_assistant_response_faults_list)-1)]
+    answer_content = _answer_template[random.randint(0, len(_answer_template)-1)]
+    result_dict.update({
       'system_content': system_prompt,
       'user_content': user_prompt,
       'reasoning_content': reasoning_content,
       'answer_content': answer_content,
     })
-    contents.append(prompt_dict.copy())
+    contents.append(result_dict)
 
   return contents
 
 
 def process_per_row(row, tetramax_folder, gate_func, decl_re: re.compile, name_re: re.compile):
-  # Get the dictionary of ingredients
-  prompt_dict = _user_prompt_dict.copy()
+  """
+  Process a single row from the dataset CSV.
+  
+  This function is designed to be called from multiprocessing workers.
+  It creates a base template dict that is deep-copied for each output record
+  to avoid any shared mutable state between results.
+  """
+  # Create a fresh base template dict for this row
+  # This will be deep-copied for each individual result in process()
+  base_prompt_dict = copy.deepcopy(_user_prompt_dict)
   
   # Get 'Pattern' from the row
   patterns = pd.read_csv(StringIO(row['patterns']), sep="\s+", dtype=str)
   patterns.columns = patterns.columns.astype(int)
   
-  # Pre-parse netlist ONCE
+  # Pre-parse netlist ONCE per row
   optimized_netlist = OptimizedNetlist(row['netlist'], gate_func, decl_re, name_re)
   
-  # Format query
-  prompt_dict.update({'module_name': '_'.join(row['module_name'].split('_')[1:]), 'netlist': row['netlist']})
+  # Add row-level data to the base template
+  base_prompt_dict.update({
+    'module_name': '_'.join(row['module_name'].split('_')[1:]), 
+    'netlist': row['netlist']
+  })
   
-  _process = partial(process, prompt_dict=prompt_dict, optimized_netlist=optimized_netlist, module_name=row['module_name'], tetramax_folder=tetramax_folder, gate_func=gate_func)
+  _process = partial(
+    process, 
+    base_prompt_dict=base_prompt_dict,  # Renamed for clarity - this is a template, not shared state
+    optimized_netlist=optimized_netlist, 
+    module_name=row['module_name'], 
+    tetramax_folder=tetramax_folder, 
+    gate_func=gate_func
+  )
   
   # Use explode to flatten list of lists, then reset index
   result_series = patterns.apply(_process, axis=1).explode().reset_index(drop=True)
@@ -539,6 +702,30 @@ def process_per_row(row, tetramax_folder, gate_func, decl_re: re.compile, name_r
   
   # Convert Series of dicts to DataFrame
   return pd.DataFrame(result_series.tolist())
+
+
+def _worker_init(seed_offset):
+  """
+  Initialize worker process with a unique random seed.
+  
+  When using fork-based multiprocessing, all workers inherit the parent's 
+  random state, causing them to generate correlated "random" sequences.
+  This initializer reseeds each worker with a unique seed based on:
+  - The current process ID (unique per worker)
+  - A seed offset provided by the parent (for reproducibility control)
+  
+  This prevents race conditions where multiple workers might generate
+  identical "random" selections for system prompts, user prompts, etc.
+  """
+  import os
+  # Create a unique seed for this worker using PID and optional offset
+  worker_seed = os.getpid() + seed_offset
+  random.seed(worker_seed)
+  # Also seed numpy if it's being used
+  try:
+    np.random.seed(worker_seed)
+  except:
+    pass
 
 
 if __name__ == '__main__':
@@ -679,6 +866,15 @@ if __name__ == '__main__':
       json.dump(config_dump, f, indent=2)
     print(f"Configuration exported to {args.export_config}")
   
+  # Pre-compile all gate functions BEFORE creating the multiprocessing pool
+  # This populates _compiled_gate_cache so workers inherit the pre-compiled lambdas
+  # rather than each worker redundantly compiling the same functions
+  print("Pre-compiling gate functions for multiprocessing efficiency...")
+  for gate_type, pins in gate_func.items():
+    for port in pins.keys():
+      get_compiled_func(gate_type, port, gate_func)
+  print(f"Pre-compiled {len(_compiled_gate_cache)} gate functions")
+  
   dataset = args.csv_dataset
   tetramax_folder = args.tetramax_folder
   model = args.load_model
@@ -689,7 +885,7 @@ if __name__ == '__main__':
   # df.sort_values("num_instances", inplace=True) ... (Skipping in-memory sort)
   
   tokenizer = AutoTokenizer.from_pretrained(model)
-  cpu_pool = 1 #os.cpu_count() or 1
+  cpu_pool = os.cpu_count() or 1
   
   _process_per_row = partial(process_per_row, tetramax_folder=tetramax_folder, gate_func=gate_func, decl_re=decl_re, name_re=name_re)
   
@@ -721,10 +917,21 @@ if __name__ == '__main__':
           yield record
 
   pool = None
+  
+  # Seed offset for worker initialization - use current time for randomness
+  # or set to a fixed value for reproducibility
+  import time
+  seed_offset = int(time.time())
 
   try:
     if cpu_pool > 1:
-      pool = mp.Pool(processes=cpu_pool)
+      # Create pool with worker initializer to reseed random number generators
+      # This prevents race conditions where workers generate correlated random sequences
+      pool = mp.Pool(
+        processes=cpu_pool,
+        initializer=_worker_init,
+        initargs=(seed_offset,)
+      )
       iterator = pool.imap(_process_per_row, data_generator())
     else:
       iterator = map(_process_per_row, data_generator())
@@ -747,9 +954,13 @@ if __name__ == '__main__':
         ('input_vector', pa.string()), # Converted to JSON string
         ('expected_output', pa.string()), # Converted to JSON string
         ('snapshot', pa.string()),
-        ('detected_faults', pa.string())
+        ('detected_faults', pa.string()),
+        ('fault_propagation_gates', pa.string()),  # Gates whose outputs are on fault propagation path
+        ('fault_propagation_nets', pa.string()),  # Nets on the fault propagation path
+        ('backtrack_gates', pa.string()),  # Gates whose inputs include sensitizing inputs
+        ('backtrack_nets', pa.string()),  # Backtrack: inputs controlling and non-controlling nets
     ])
-    # import code; code.interact(local=dict(globals(), **locals()))
+    
     for i, df_chunk in tqdm(enumerate(iterator), total=total_lines, desc=f"Processing..."):
       if df_chunk is None or df_chunk.empty:
         print(f"Empty chunk... {i}")
