@@ -26,7 +26,7 @@ import copy
 from utils import best_match
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from sympy import symbols, lambdify
 from sympy.parsing.sympy_parser import parse_expr
 from sympy.core.symbol import Symbol
@@ -301,14 +301,28 @@ class OptimizedNetlist:
 def convert_string_to_dict(x, sep=':'):
   return {net.strip(): int(value.strip()) for net_value in x.split(',') for net, value in [net_value.split(sep)]}
 
-def fast_fault_sim(input_nets_and_vector, expected_output_nets_and_vector, fault, optimized_netlist, gate_func, return_rewards = False):
+def fast_fault_sim(input_nets_and_vector: str | Dict[str, int], expected_output_nets_and_vector: str | Dict[str, int], fault: str, optimized_netlist: OptimizedNetlist, gate_func: str | Dict[str, Dict[str, Dict[str, str]]], return_rewards: bool = False) -> pd.DataFrame | Tuple[pd.DataFrame, Dict[str, bool]]:
   """
   Performs fault simulation comparing good machine vs bad machine (with stuck-at fault).
   
-  Also computes:
-  - fault_propagation_path: nets where the fault effect propagates forward toward outputs
-  - backtrack_fault_path: inputs that control the fault propagation (sensitizing inputs)
+  Args:
+    input_nets_and_vector: dictionary of input nets and their values
+    expected_output_nets_and_vector: dictionary of expected output nets and their values
+    fault: string representation of the fault
+    optimized_netlist: OptimizedNetlist object
+    gate_func: path to gate function JSON file or dictionary of gate functions
+    return_rewards: boolean indicating whether to return rewards
   """
+  if isinstance(gate_func, str):
+    with open(gate_func, 'r') as f:
+      gate_func = json.load(f)
+  else:
+    try:
+      with open('sim_config.json', 'r') as f:
+        gate_func = json.load(f)
+    except:
+      return {"error": "I cannot find the dictionary of gate functions"}
+    
   FAULT_VALUE = r"sa(\d)\s*(.*)"
   fault_value_re = re.compile(FAULT_VALUE)
   
