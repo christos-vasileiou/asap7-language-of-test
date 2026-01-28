@@ -94,7 +94,8 @@ ds = load_dataset(dataset_dict[DATASET], split="train", streaming=True)
 
 # Directory where we cache the generated RTL source files and synthesis outputs
 # Keep each job-array task separate so results do not collide
-OUTPUT_ROOT = Path(f"../data/{DATASET}/work_{PROCID}").resolve()
+OUTPUT_PATH = Path(f"../data/{DATASET}").resolve()
+OUTPUT_ROOT = OUTPUT_PATH / f"work_{PROCID}"
 OUTPUT_ROOT.mkdir(exist_ok=True, parents=True)
 
 print(f"Rank config → STRIDE={STRIDE} PROCID={PROCID} OUTPUT_ROOT={OUTPUT_ROOT}")
@@ -434,7 +435,7 @@ if __name__ == "__main__":
     def _scan_completed_examples() -> Set[int]:
         completed: Set[int] = set()
         # Look across all work_* directories to catch previous runs
-        for work_dir in Path.cwd().glob("../data/work_*"):
+        for work_dir in OUTPUT_PATH.glob("work_*"):
             if not work_dir.is_dir():
                 continue
             for v_file in work_dir.glob("example_*/results/*.v"):

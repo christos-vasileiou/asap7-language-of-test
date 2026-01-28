@@ -131,6 +131,12 @@ def expand_nets(nets: dict) -> list:
   return expanded_nets
 
 
+def df_to_dict(df: pd.DataFrame) -> str:
+    df.index = df.index.map(str.strip)
+    df.columns = df.columns.map(str.strip)
+    return str(df.to_dict())
+
+
 def df_to_compact_markdown(
   df: pd.DataFrame,
   *,
@@ -650,7 +656,7 @@ def process(x, base_prompt_dict, optimized_netlist, module_name, tetramax_folder
       # Deep copy the dicts to ensure no shared references between results
       'input_vector': copy.deepcopy(input_nets_and_vector), 
       'expected_output': copy.deepcopy(expected_output_nets_and_vector), 
-      'snapshot': df_to_compact_markdown(snapshot[["Good Machine", "Bad Machine"]]), 
+      'snapshot': df_to_dict(snapshot[["Good Machine", "Bad Machine"]]), 
       'detected_faults': detected_faults_in_fault_path_str,
       'fault_propagation_gates': fault_propagation_gates_str,  # Gates whose outputs are on propagation path
       'fault_propagation_nets': fault_propagation_nets_str,  # Nets on the fault propagation path

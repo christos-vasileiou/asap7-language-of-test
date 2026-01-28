@@ -10,11 +10,11 @@ set -euo pipefail
 
 # Define environment variables
 export DATA_PATH="/home/cxv200006/work/transformers_atpg/data"
-export DATASET="freeset"
-export LIBRARY="asap7sc7p5t_28"
-export LIB_VARIANT="RVT"
-export PVT_CORNER="TT"
-export MODEL="meta-llama/Llama-3.3-70B-Instruct"
+LIB_VARIANT="${1:-${LIB_VARIANT:-RVT}}"  # RVT / LVT / SLVT / SRAM
+PVT_CORNER="${2:-${PVT_CORNER:-TT}}"  # TT / SS / FF
+DATASET="${3:-${DATASET:-freeset}}"  # freeset / metrex / shailja
+LIBRARY="${4:-${LIBRARY:-asap7sc7p5t_28}}"  # asap7sc7p5t_28
+export LIB_VARIANT PVT_CORNER DATASET LIBRARY
 
 # Optional: Hugging Face upload settings
 export HF_USERNAME="chrivasileiou"
