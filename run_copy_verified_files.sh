@@ -1,4 +1,12 @@
 #!/bin/bash
+#SBATCH --job-name=copy_verified_files        # Job name
+#SBATCH --output=logs/copy_verified_files_%j.out   # Standard output file (%j will be replaced with job ID)
+#SBATCH --error=logs/copy_verified_files_%j.err    # Standard error file
+#SBATCH --nodes=1                       # Request 1 node
+#SBATCH --ntasks=1                      # Run a single task
+#SBATCH --cpus-per-task=64              # Request 64 CPUs per task
+#SBATCH --mem=128G                       # Request 128GB of memory
+#SBATCH --partition=normal
 #
 # Script to copy verified verilog and json files with unique index prefix
 # 

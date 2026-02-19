@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import os
 import regex as re
-from glob import glob
 from vars import (
   _user_prompt_dict,
   _training_prompts_faults_list,
@@ -13,7 +12,6 @@ from vars import (
   _answer_template,
   chat_template, 
 )
-from datasets import DatasetDict, Dataset
 from transformers import AutoTokenizer
 import random
 from io import StringIO
@@ -21,13 +19,11 @@ from functools import partial
 from tqdm import tqdm
 import argparse
 import multiprocessing as mp
-import subprocess
 import copy
 from utils import best_match
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Dict, List, Tuple
-from sympy import symbols, lambdify
+from sympy import symbols
 from sympy.parsing.sympy_parser import parse_expr
 from sympy.core.symbol import Symbol
 from huggingface_hub import HfApi
@@ -36,535 +32,18 @@ import pyarrow.parquet as pq
 import json
 import shutil
 
-
-@dataclass
-class Gate:
-  """Represents a gate instance in a structural netlist."""
-  cell: str
-  name: str
-  connections: Dict[str, str]  # port name → net name
-
-
-@dataclass
-class Netlist:
-  """A combinational netlist parsed from a Verilog module."""
-  inputs: List[str]
-  outputs: List[str]
-  wires: List[str]
-  gates: List[Gate]
-
-  @property
-  def all_nets(self) -> List[str]:
-    return list(dict.fromkeys(self.inputs + self.outputs + self.wires))
-
-
-def float_cols_to_int_with_x(df: pd.DataFrame) -> pd.DataFrame:
-  """
-  """
-  df = df.copy()
-  float_cols = df.select_dtypes(include=["float", "Float64"]).columns
-  for c in float_cols:
-    df[c] = df[c].map(lambda v: 'x' if pd.isna(v) else int(v))
-  return df
-
-
-def is_every_net_evaluated(machine: dict) -> bool:
-  flag = True
-  for n in machine.values():
-    if not isinstance(n, int):
-      flag = False
-      break
-  return flag
-
-
-def parse_range(rng: str | None) -> int:
-    """Convert [msb:lsb] into integer width. If None, return 1."""
-    if not rng:
-        return 1
-    msb, lsb = map(int, re.findall(r"\d+", rng))
-    return abs(msb - lsb) + 1
-
-
-def get_net_length(verilog_text: str, keyword: str, decl_re: re.compile, name_re: re.compile) -> dict:
-  """
-  Get the length of the nets for a given keyword.
-  """
-  keyword = keyword.lower()
-  assert keyword in {"input", "output", "inout", "wire", "reg", "tri"}, f"Keyword must be input/output/inout/wire/reg/tri, got {keyword}"
-
-  nets = dict()
-  for m in decl_re.finditer(verilog_text):
-    kind = m.group("kind")
-    if kind != keyword:
-      continue
-    packed = m.group("packed")
-    rest = m.group("rest")
-    bus_width = parse_range(packed)
-    for token in rest.split(","):
-      nm = name_re.match(token)
-      if not nm:
-        continue
-      unpacked = nm.group("unpacked")
-      array_len = parse_range(unpacked)
-      nets[token.strip()] = (bus_width, array_len, True if packed else False, True if unpacked else False)
-
-  return nets
-
-
-def expand_nets(nets: dict) -> list:
-  """
-  Expand the nets to include the bus width and the array length.
-  """
-  expanded_nets = []
-  for net, (bus_len, array_len, packed, unpacked) in nets.items():
-    if bus_len == 1 and array_len == 1 and not packed and not unpacked:
-      expanded_nets.append(net)
-      continue
-    for i in range(bus_len):
-      for j in range(max(1, array_len)):
-        suffix = ""
-        if packed:
-          suffix += f"[{i}]"
-        if unpacked:
-          suffix += f"[{j}]"
-        expanded_nets.append(f"{net}{suffix}")
-  return expanded_nets
-
-
-def df_to_dict(df: pd.DataFrame) -> str:
-    df.index = df.index.map(str.strip)
-    df.columns = df.columns.map(str.strip)
-    return str(df.to_dict())
-
-
-def df_to_compact_markdown(
-  df: pd.DataFrame,
-  *,
-  include_index: bool = True,
-  include_index_name: bool = False,   # matches your example (blank top-left cell)
-  na_rep: str = "",
-  col_sep: str = " / ",               # for MultiIndex columns
-  idx_sep: str = " / ",               # for MultiIndex index
-) -> str:
-  """
-  Emits a compact GitHub-flavored markdown table like:
-  | | Good Machine | Bad Machine |
-  |-|-|-|
-  | net1 | 0 | 0 |
-  ...
-  Constraints:
-  - exactly one space padding inside each data/header cell: `| {cell} |`
-  - separator row uses only '-' and '|': `|-|-|-|`
-  """
-
-  if not isinstance(df, pd.DataFrame):
-    df = pd.DataFrame(df)
-  def _mi_to_str(x, sep: str) -> str:
-    if isinstance(x, tuple):
-      parts = ["" if p is None else str(p) for p in x]
-      s = sep.join(parts).strip()
-      return s
-    return "" if x is None else str(x)
-  def _escape_cell(s: str) -> str:
-    # keep markdown structure stable
-    s = s.replace("|", r"\|")
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = s.replace("\n", "<br>")
-    return s
-
-  # Build headers
-  col_labels = [_escape_cell(_mi_to_str(c, col_sep)) for c in df.columns.tolist()]
-
-  # Build index labels
-  if include_index:
-    if isinstance(df.index, pd.MultiIndex):
-      idx_labels = [_escape_cell(_mi_to_str(t, idx_sep)) for t in df.index.tolist()]
-    else:
-      idx_labels = [_escape_cell(_mi_to_str(i, idx_sep)) for i in df.index.tolist()]
-  else:
-    idx_labels = []
-
-  # Top-left header cell
-  if include_index:
-    idx_name = "" if not include_index_name else _escape_cell("" if df.index.name is None else str(df.index.name))
-    header_cells = [idx_name] + col_labels
-  else:
-    header_cells = col_labels
-
-  # Markdown lines
-  lines = []
-  lines.append("| " + " | ".join(header_cells) + " |")
-  lines.append("|" + "|".join("-" for _ in header_cells) + "|")
-  # Data rows
-  for r, row in enumerate(df.itertuples(index=False, name=None)):
-    row_cells = []
-    for v in row:
-      if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
-        s = na_rep
-      else:
-        s = str(v)
-      row_cells.append(_escape_cell(s))
-    if include_index:
-      line_cells = [idx_labels[r]] + row_cells
-    else:
-      line_cells = row_cells
-
-    lines.append("| " + " | ".join(line_cells) + " |")
-
-  return "\n".join(lines)
-
-
-# Global cache for compiled gate functions
-_compiled_gate_cache = {}
-
-
-def get_compiled_func(gate_type, port, gate_func):
-  key = (gate_type, port)
-  if key in _compiled_gate_cache:
-    return _compiled_gate_cache[key]
-  
-  entry = gate_func[gate_type][port]
-  expr = entry['function']
-  sym_names = sorted(entry['symbols'].keys())
-  syms = [symbols(n) for n in sym_names]
-  # Compile lambda
-  # Use 'numpy' for potential vectorization support, though we use scalars here mostly.
-  try:
-    fn = lambdify(syms, expr, modules='numpy')
-  except Exception as e:
-    print(f"Error compiling lambda for {gate_type} {port}: {e}")
-    fn = None
-      
-  _compiled_gate_cache[key] = (fn, sym_names)
-  return fn, sym_names
-
-
-class OptimizedNetlist:
-  def __init__(self, verilog_text, gate_func, decl_re, name_re):
-    self.instructions = []
-    
-    # Cache net lists
-    # self.wire_nets = expand_nets(get_net_length(verilog_text, "wire", decl_re, name_re))
-    self.input_nets = expand_nets(get_net_length(verilog_text, "input", decl_re, name_re))
-    self.output_nets = expand_nets(get_net_length(verilog_text, "output", decl_re, name_re))
-    
-    self.parse(verilog_text, gate_func)
-
-  def parse(self, verilog_text, gate_func):
-    GATE_INGREDIENT = r"((?:\\[^\s]+|\w+))\s+((?:\\[^\s]+|\w+))\s*\(\s*([\s\S]+?)\s*\)\s*;"
-    GATE_CONNECTIONS = r"\.((?:\\[^\s]+|\w+))\s*\(\s*([^)]+?)\s*\)"
-    ASSIGN_STATEMENT = r"assign\s+(?P<net>(?:\\[^\s]+|[\w\[\]\*]+))\s*=\s*(?P<val>(?:\\[^\s]+|[\w\[\]\*]+))\s*;"
-    LOGIC_VALUE = r"\*Logic(?P<val>[01]+)\*\s*"
-
-    gate_ingredients = re.compile(GATE_INGREDIENT)
-    gate_connections = re.compile(GATE_CONNECTIONS)
-    assign_re = re.compile(ASSIGN_STATEMENT)
-    logic_value = re.compile(LOGIC_VALUE)
-    
-    # Parse assigns
-    for match in assign_re.finditer(verilog_text):
-      assign_net, assign_value = match.groups()
-      m = logic_value.search(assign_value)
-      if m:
-        assign_value = m.group('val')
-      if assign_value.isdigit():
-        val = int(assign_value)
-        self.instructions.append(('assign_const', assign_net, val))
-      else:
-        self.instructions.append(('assign_net', assign_net, assign_value))
-
-    # Parse gates
-    for match in gate_ingredients.finditer(verilog_text):
-      gate_type, instance, connections_str = match.groups()
-      if gate_type.startswith('module'):
-        continue
-      
-      if gate_type not in gate_func:
-        # Fallback or skip? Original code would likely fail later or skip
-        # Assuming mostly valid standard cells
-        continue
-
-      connections = dict(gate_connections.findall(connections_str))
-      
-      # Clean logic values in connections
-      for p, n in connections.items():
-        m = logic_value.search(n)
-        if m:
-          connections[p] = m.group('val')
-
-      gate_output_ports = set(gate_func[gate_type].keys())
-      instance_ports = set(connections.keys())
-      
-      out_ports = instance_ports.intersection(gate_output_ports)
-      in_ports = instance_ports.difference(gate_output_ports)
-      
-      # We store instruction for each output port
-      for out_p in out_ports:
-        out_net = connections[out_p]
-        input_map = {p: connections.get(p) for p in in_ports} # map port name to net name
-        self.instructions.append(('gate', gate_type, instance, out_p, out_net, input_map))
-
-def convert_string_to_dict(x, sep=':'):
-  return {net.strip(): int(value.strip()) for net_value in x.split(',') for net, value in [net_value.split(sep)]}
-
-def fast_fault_sim(input_nets_and_vector: str | Dict[str, int], expected_output_nets_and_vector: str | Dict[str, int], fault: str, optimized_netlist: OptimizedNetlist, gate_func: str | Dict[str, Dict[str, Dict[str, str]]], return_rewards: bool = False) -> pd.DataFrame | Tuple[pd.DataFrame, Dict[str, bool]]:
-  """
-  Performs fault simulation comparing good machine vs bad machine (with stuck-at fault).
-  
-  Args:
-    input_nets_and_vector: dictionary of input nets and their values
-    expected_output_nets_and_vector: dictionary of expected output nets and their values
-    fault: string representation of the fault
-    optimized_netlist: OptimizedNetlist object
-    gate_func: path to gate function JSON file or dictionary of gate functions
-    return_rewards: boolean indicating whether to return rewards
-  """
-  if isinstance(gate_func, str):
-    with open(gate_func, 'r') as f:
-      gate_func = json.load(f)
-  else:
-    try:
-      with open('sim_config.json', 'r') as f:
-        gate_func = json.load(f)
-    except:
-      return {"error": "I cannot find the dictionary of gate functions"}
-    
-  FAULT_VALUE = r"sa(\d)\s*(.*)"
-  fault_value_re = re.compile(FAULT_VALUE)
-  
-  try:
-    faulty_value_str, faulty_net = fault_value_re.findall(fault)[0]
-    faulty_value = int(faulty_value_str)
-  except:
-    import traceback; traceback.print_exc()
-    return pd.DataFrame() # Or error
-  
-  # Fault propagation path from the injection point to the outputs
-  fault_propagation_path = [faulty_net] # injection point
-  
-  if isinstance(input_nets_and_vector, str):
-    input_nets_and_vector = convert_string_to_dict(input_nets_and_vector, sep=':' if ':' in input_nets_and_vector else '=')
-  if isinstance(expected_output_nets_and_vector, str):
-    expected_output_nets_and_vector = convert_string_to_dict(expected_output_nets_and_vector, sep=':' if ':' in expected_output_nets_and_vector else '=')
-  _inputs = list(input_nets_and_vector.keys())
-  _outputs = list(expected_output_nets_and_vector.keys())
-  
-  # Calculate rewards if input and output vectors have the correct length
-  if return_rewards:
-    rewards = {}
-    # Check if the input vector has the correct length and if the nets names are correct
-    rewards['input_nets_match'] = _inputs == optimized_netlist.input_nets
-    # Check if the output vector has the correct length and if the nets names are correct
-    rewards['output_nets_match'] = _outputs == optimized_netlist.output_nets
-  
-  good_machine = input_nets_and_vector.copy()
-  good_machine.update(expected_output_nets_and_vector)
-  
-  bad_machine = input_nets_and_vector.copy()
-  bad_machine.update({faulty_net: faulty_value})
-  
-  # Dependency graph: maps each net to the set of nets it directly depends on
-  # Used for backtracing from fault propagation path to controlling inputs
-  net_dependencies = {}
-  
-  # Helper to resolve value
-  def resolve(machine, val, max_depth=20):
-    if isinstance(val, int): return val
-    visited = 0
-    curr = val
-    while not isinstance(curr, int):
-      if isinstance(curr, str) and curr.isdigit():
-        return int(curr)
-      if curr not in machine:
-        return curr # Return name if missing (not computed yet)
-      nex = machine[curr]
-      if nex == curr: break # Self-loop?
-      curr = nex
-      visited += 1
-      if visited > max_depth: break 
-    return curr
-  
-  # Pass 1: Evaluate instructions and build dependency graph
-  for instr in optimized_netlist.instructions:
-    typ = instr[0]
-    
-    if typ == 'assign_const':
-      _, net, val = instr
-      if net not in good_machine: good_machine[net] = val
-      
-      # No dependencies for constant assignments
-      net_dependencies[net] = set()
-      
-      # Bad Machine
-      # If net is fault path (i.e. it IS the faulty net), we don't overwrite it with the assign
-      if net in fault_propagation_path:
-        pass
-      else:
-        if net not in bad_machine: bad_machine[net] = val
-        
-    elif typ == 'assign_net':
-      _, net, src = instr
-      
-      # Track dependency: net depends on src
-      if not (isinstance(src, str) and src.isdigit()):
-        net_dependencies[net] = {src}
-      else:
-        net_dependencies[net] = set()
-      
-      # Good Machine Update
-      src_val_gm = resolve(good_machine, src)
-      good_machine[net] = src_val_gm
-      
-      # Bad Machine Update
-      if net in fault_propagation_path:
-        continue # Already stuck
-      
-      src_val_bm = resolve(bad_machine, src)
-      bad_machine[net] = src_val_bm
-      
-      # Fault Propagation
-      if src in fault_propagation_path:
-        fault_propagation_path.append(net)
-      
-    elif typ == 'gate':
-      _, gate_type, instance, out_port, out_net, input_map = instr
-      
-      fn, sym_names = get_compiled_func(gate_type, out_port, gate_func)
-      if not fn: continue
-      
-      # Track dependencies: out_net depends on all input nets of this gate
-      gate_input_nets = set()
-      for sym in sym_names:
-        p_net = input_map.get(sym)
-        if p_net is not None and not (isinstance(p_net, str) and p_net.isdigit()):
-          gate_input_nets.add(p_net)
-      net_dependencies[out_net] = gate_input_nets
-      
-      def eval_gate_inputs(machine):
-        args = []
-        for sym in sym_names:
-          p_net = input_map.get(sym)
-          if p_net is None: return None # Should not happen
-          val = resolve(machine, p_net)
-          
-          if not isinstance(val, int):
-            if isinstance(val, str) and val.isdigit():
-              val = int(val)
-            else:
-              return None # Can't evaluate yet
-          args.append(val)
-        return args
-      
-      # Good Machine
-      args_gm = eval_gate_inputs(good_machine)
-      if args_gm:
-        out_val = int(bool(fn(*args_gm)))
-        good_machine[out_net] = out_val
-      
-      # Bad Machine
-      if out_net not in fault_propagation_path:
-        args_bm = eval_gate_inputs(bad_machine)
-        if args_bm:
-          out_val_bm = int(bool(fn(*args_bm)))
-          bad_machine[out_net] = out_val_bm
-          
-          # Check propagation
-          if args_gm and good_machine.get(out_net) != out_val_bm:
-            fault_propagation_path.append(out_net)
-  
-  # Final Cleanup Loops (resolve any remaining aliases)
-  def cleanup(machine):
-    keys = list(machine.keys())
-    # We iterate a few times to settle aliases
-    for _ in range(5): # Cap iterations
-      changed = False
-      for net in keys:
-        val = machine[net]
-        if not isinstance(val, int):
-          res = resolve(machine, val)
-          if res != val:
-            machine[net] = res
-            changed = True
-      if not changed: break
-  
-  cleanup(good_machine)
-  cleanup(bad_machine)
-  
-  # Filter keys
-  good_keys_to_remove = [net for net in good_machine.keys() if isinstance(net, int) or (isinstance(net, str) and net.isdigit())]
-  for net in good_keys_to_remove: good_machine.pop(net)
-  
-  bad_keys_to_remove = [net for net in bad_machine.keys() if isinstance(net, int) or (isinstance(net, str) and net.isdigit())]
-  for net in bad_keys_to_remove: bad_machine.pop(net)
-  
-  # ============================================================
-  # Backtracing: Find the inputs that control fault propagation
-  # ============================================================
-  # We trace backwards from nets in the fault_propagation_path to find
-  # all the primary inputs that affect whether the fault propagates.
-  # These are the "sensitizing inputs" that must have specific values
-  # for the fault effect to be observable at the outputs.
-  
-  def compute_backtrack_path(propagation_path, net_deps, primary_inputs):
-    """
-    Trace backwards from the fault propagation path to find controlling inputs.
-    
-    For each net on the fault propagation path, we recursively find all nets it depends on,
-    continuing until we reach primary inputs. The result is the set of primary inputs
-    that control the fault propagation (sensitizing inputs).
-    
-    Args:
-      propagation_path: List of nets where fault propagates (forward path)
-      net_deps: Dictionary mapping net -> set of nets it depends on
-      primary_inputs: Set of primary input net names
-    
-    Returns:
-      List of primary inputs that control the fault propagation
-    """
-    backtrack_inputs = set()
-    visited = set()
-    
-    # Start from all nets on the propagation path
-    to_visit = set(propagation_path)
-    
-    while to_visit:
-      net = to_visit.pop()
-      if net in visited:
-        continue
-      visited.add(net)
-      
-      # If this is a primary input, add to backtrack result
-      if net in primary_inputs:
-        backtrack_inputs.add(net)
-      # Otherwise, add its dependencies to visit
-      elif net in net_deps:
-        to_visit.update(net_deps[net])
-        backtrack_inputs.update(net_deps[net])
-    return list(backtrack_inputs)
-  
-  _inputs_set = set(_inputs)
-  backtrack_fault_path = compute_backtrack_path(fault_propagation_path, net_dependencies, _inputs_set)
-  
-  simulation = pd.concat([pd.Series(good_machine), pd.Series(bad_machine)], axis=1)
-  simulation[2] = simulation.index.isin(_inputs)
-  simulation[3] = simulation.index.isin(_outputs)
-  simulation[4] = simulation.index.isin(fault_propagation_path)
-  simulation[5] = simulation.index.isin(backtrack_fault_path)
-
-  simulation = float_cols_to_int_with_x(simulation)
-  simulation.columns = ["Good Machine", "Bad Machine", "PIs", "POs", "Fault Propagation Path", "Backtrack Sensitizing Inputs"]
-  
-  priority = {
-    (True,  False): 0,
-    (False, False): 1,
-    (False, True):  2
-  }
-  simulation["Priority"] = simulation[["PIs", "POs"]].apply(tuple, axis=1).map(priority)
-  simulation = simulation.sort_values("Priority").drop(columns=["Priority"])
-  
-  if return_rewards:
-    return simulation, rewards
-  return simulation
+# Extracted modules
+from netlist_utils import Gate, Netlist, parse_range, get_net_length, expand_nets, verify_module_name
+from fault_sim import (
+  float_cols_to_int_with_x,
+  is_every_net_evaluated,
+  convert_string_to_dict,
+  _compiled_gate_cache,
+  get_compiled_func,
+  OptimizedNetlist,
+  fast_fault_sim,
+)
+from df_format import df_to_json, df_to_compact_markdown
 
 
 def process(x, base_prompt_dict, optimized_netlist, module_name, tetramax_folder, gate_func):
@@ -656,7 +135,7 @@ def process(x, base_prompt_dict, optimized_netlist, module_name, tetramax_folder
       # Deep copy the dicts to ensure no shared references between results
       'input_vector': copy.deepcopy(input_nets_and_vector), 
       'expected_output': copy.deepcopy(expected_output_nets_and_vector), 
-      'snapshot': df_to_dict(snapshot[["Good Machine", "Bad Machine"]]), 
+      'snapshot': df_to_json(snapshot[["Good Machine", "Bad Machine"]]),
       'detected_faults': detected_faults_in_fault_path_str,
       'fault_propagation_gates': fault_propagation_gates_str,  # Gates whose outputs are on propagation path
       'fault_propagation_nets': fault_propagation_nets_str,  # Nets on the fault propagation path
@@ -780,6 +259,7 @@ if __name__ == '__main__':
   parser.add_argument('-tf', '--tetramax_folder', type=str, default=_default_tetramax_folder())
   parser.add_argument('-lm', '--load_model', type=str, default=_default_load_model())
   parser.add_argument('--export_config', type=str, help="Export simulation config to JSON file", default=None)
+  parser.add_argument('--eval_ratio', type=float, default=0.1, help="Fraction of data to assign to eval split (default: 0.1)")
   args = parser.parse_args()
 
   # Regex to match a cell and its block recursively using regex module
@@ -909,11 +389,16 @@ if __name__ == '__main__':
   
   _process_per_row = partial(process_per_row, tetramax_folder=tetramax_folder, gate_func=gate_func, decl_re=decl_re, name_re=name_re)
   
-  # Output directory for sharded files
+  # Output directory for sharded files (with train/eval subdirectories)
   output_shards_dir = DATA_PATH / DATASET / f"dataset.{suffix}_shards"
   if output_shards_dir.exists():
       shutil.rmtree(output_shards_dir)
-  output_shards_dir.mkdir(parents=True, exist_ok=True)
+  train_dir = output_shards_dir / "train"
+  eval_dir  = output_shards_dir / "eval"
+  train_dir.mkdir(parents=True, exist_ok=True)
+  eval_dir.mkdir(parents=True, exist_ok=True)
+  eval_ratio = args.eval_ratio
+  print(f"Split ratio: train={1 - eval_ratio:.0%}, eval={eval_ratio:.0%}")
   
   # Calculate total lines for tqdm estimation
   try:
@@ -956,9 +441,14 @@ if __name__ == '__main__':
     else:
       iterator = map(_process_per_row, data_generator())
 
-    writer = None
-    shard_idx = 0
-    rows_in_current_shard = 0
+    # Per-split writers and counters
+    writers = {"train": None, "eval": None}
+    shard_idxs = {"train": 0, "eval": 0}
+    rows_in_shard = {"train": 0, "eval": 0}
+    split_dirs = {"train": train_dir, "eval": eval_dir}
+    total_rows_written = {"train": 0, "eval": 0}
+    module_name_correct = 0
+    module_name_fixed   = 0
     ROWS_PER_SHARD = 1000
 
     # Define explicit schema to handle nested structures (dicts -> Map) consistently
@@ -980,6 +470,23 @@ if __name__ == '__main__':
         ('backtrack_gates', pa.string()),  # Gates whose inputs include sensitizing inputs
         ('backtrack_nets', pa.string()),  # Backtrack: inputs controlling and non-controlling nets
     ])
+
+    def _write_split(split_name, table):
+      """Write a pyarrow Table to the appropriate split shard."""
+      if table.num_rows == 0:
+        return
+      if writers[split_name] is None:
+        shard_path = split_dirs[split_name] / f"data-{shard_idxs[split_name]:05d}.parquet"
+        writers[split_name] = pq.ParquetWriter(shard_path, schema)
+      writers[split_name].write_table(table)
+      rows_in_shard[split_name] += table.num_rows
+      total_rows_written[split_name] += table.num_rows
+
+      if rows_in_shard[split_name] >= ROWS_PER_SHARD:
+        writers[split_name].close()
+        writers[split_name] = None
+        rows_in_shard[split_name] = 0
+        shard_idxs[split_name] += 1
     
     for i, df_chunk in tqdm(enumerate(iterator), total=total_lines, desc=f"Processing..."):
       if df_chunk is None or df_chunk.empty:
@@ -990,31 +497,46 @@ if __name__ == '__main__':
         if col not in df_chunk.columns:
           df_chunk[col] = None
           
+      # Verify module_name matches the netlist header and fix mismatches
+      if 'netlist' in df_chunk.columns and 'module_name' in df_chunk.columns:
+        for idx in df_chunk.index:
+          netlist_val = df_chunk.at[idx, 'netlist']
+          mname_val   = df_chunk.at[idx, 'module_name']
+          if pd.notna(netlist_val) and pd.notna(mname_val):
+            corrected, changed = verify_module_name(str(netlist_val), str(mname_val))
+            if changed:
+              df_chunk.at[idx, 'module_name'] = corrected
+              module_name_fixed += 1
+            else:
+              module_name_correct += 1
+
       # Convert dicts to JSON strings for map columns
       for col in ['input_vector', 'expected_output']:
         if col in df_chunk.columns:
           df_chunk[col] = df_chunk[col].apply(lambda x: json.dumps(x) if x is not None else None)
-          
-      try:
-        table = pa.Table.from_pandas(df_chunk, schema=schema)
-      except Exception as e:
-        print(f"Error converting chunk to table: {e}")
-        continue
-      
-      if writer is None:
-        shard_path = output_shards_dir / f"data-{shard_idx:05d}.parquet"
-        writer = pq.ParquetWriter(shard_path, schema)
-      writer.write_table(table)
-      rows_in_current_shard += len(df_chunk)
-      
-      if rows_in_current_shard >= ROWS_PER_SHARD:
-        writer.close()
-        writer = None
-        rows_in_current_shard = 0
-        shard_idx += 1
 
-    if writer:
-      writer.close()
+      # Randomly assign each row to train or eval (equivalent to shuffle + split)
+      mask = np.random.random(len(df_chunk)) < eval_ratio
+      df_eval  = df_chunk[mask]
+      df_train = df_chunk[~mask]
+
+      for split_name, df_split in [("train", df_train), ("eval", df_eval)]:
+        if df_split.empty:
+          continue
+        try:
+          table = pa.Table.from_pandas(df_split, schema=schema)
+        except Exception as e:
+          print(f"Error converting chunk to table ({split_name}): {e}")
+          continue
+        _write_split(split_name, table)
+
+    # Close any remaining open writers
+    for split_name in writers:
+      if writers[split_name]:
+        writers[split_name].close()
+
+    print(f"Rows written — train: {total_rows_written['train']}, eval: {total_rows_written['eval']}")
+    print(f"Module name verification — correct: {module_name_correct}, fixed: {module_name_fixed}")
 
   finally:
     if pool:
@@ -1022,8 +544,12 @@ if __name__ == '__main__':
       pool.join()
 
   print(f"Dataset written to {output_shards_dir}")
+  print(f"  train/ : {shard_idxs['train'] + (1 if rows_in_shard['train'] else 0)} shard(s)")
+  print(f"  eval/  : {shard_idxs['eval']  + (1 if rows_in_shard['eval']  else 0)} shard(s)")
 
   # Upload to Hugging Face
+  # The folder structure  train/*.parquet  and  eval/*.parquet  is auto-detected
+  # by HuggingFace datasets, so load_dataset(repo, split="train") works out of the box.
   if HF_USERNAME and REPO_NAME:
     api = HfApi()
     REPO_ID = f"{HF_USERNAME}/{REPO_NAME}"
@@ -1037,13 +563,18 @@ if __name__ == '__main__':
         exist_ok=True
       )
       
-      api.upload_folder(
-        folder_path=str(output_shards_dir),
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        commit_message="Upload sharded dataset with JSON-serialized maps"
-      )
-      print(f"Successfully uploaded shards to {REPO_ID}")
+      # Upload each split folder so HF auto-detects the splits
+      for split_name in ("train", "eval"):
+        split_path = output_shards_dir / split_name
+        if any(split_path.iterdir()):
+          api.upload_folder(
+            folder_path=str(split_path),
+            path_in_repo=split_name,
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            commit_message=f"Upload {split_name} split shards"
+          )
+          print(f"Uploaded {split_name}/ split to {REPO_ID}")
       
       # Also try to upload README if exists
       readme_path = DATA_PATH / f"README.{suffix}.md"

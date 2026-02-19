@@ -40,7 +40,7 @@ def find_json_files_and_dirs_to_delete(base_dir: Path) -> tuple[list[Path], list
     """Find all *_info.json files in results directories and directories without 'results' subfolder using os.scandir (faster than glob for deep trees)."""
     json_files = []
     dirs_to_delete = []
-
+    
     # Walk through work_* directories
     with os.scandir(base_dir) as work_entries:
         for work_entry in work_entries:
@@ -220,14 +220,18 @@ Environment variables (with defaults):
     process_time = time.perf_counter() - start_time
     
     # Filter verified files
-    verified_files = [r for r in results if r['error'] is None and 'verification_result' in r and r['verification_result'] == 'succeed']
+    verified_files = [r for r in results if r['error'] is None and 'verification_result' in r and r['verification_result'] == 'succeed' and r['total_cell_count'] > 0]
     skipped_no_verilog = [r for r in results if r['error'] is not None and r['error'].startswith('Verilog file not found')]
-    skipped_not_verified = [r for r in results if r['error'] is None and 'verification_result' in r and r['verification_result'] != 'succeed']
+    skipped_not_verified = [r for r in results if r['error'] is None and 'verification_result' in r and (r['verification_result'] != 'succeed' or r['total_cell_count'] == 0)]
+    combinational_circuits = [r for r in results if r['error'] is None and 'verification_result' in r and r['verification_result'] == 'succeed' and r['has_sequential_logic'] != True and r['total_cell_count'] > 0]
+    sequential_circuits = [r for r in results if r['error'] is None and 'verification_result' in r and r['verification_result'] == 'succeed' and r['has_sequential_logic'] == True and r['total_cell_count'] > 0]
     
     print(f"  Processed {len(results)} files in {process_time:.2f}s")
     print(f"  Verified: {len(verified_files)}")
-    print(f"  Skipped (not verified): {len(skipped_not_verified)}")
+    print(f"  Skipped (not verified or no cells): {len(skipped_not_verified)}")
     print(f"  Skipped (missing verilog): {len(skipped_no_verilog)}")
+    print(f"  Combinational circuits: {len(combinational_circuits)}")
+    print(f"  Sequential circuits: {len(sequential_circuits)}")
     
     # Phase 3: Copy verified files in parallel
     print(f"\n[Phase 3] Copying {len(verified_files)} file pairs...")
