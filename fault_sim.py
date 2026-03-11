@@ -437,11 +437,14 @@ def fast_fault_sim(
   # ---- Parse fault --------------------------------------------------
   FAULT_RE = re.compile(r"sa(\d)\s*(.*)")
   try:
-    faulty_value_str, faulty_net = FAULT_RE.findall(fault)[0]
-    faulty_value = int(faulty_value_str)
+    match = FAULT_RE.findall(fault)
+    if match:
+      faulty_value_str, faulty_net = match[0]
+      faulty_value = int(faulty_value_str)
+    else:
+      return pd.DataFrame([{"error": f"error parsing fault: {fault}.\n"}])
   except Exception:
-    import traceback; traceback.print_exc()
-    return pd.DataFrame()
+    return pd.DataFrame([{"error": f"error parsing fault: {fault}.\n"}])
 
   # ---- Parse input / output vectors ---------------------------------
   if isinstance(input_nets_and_vector, str):
