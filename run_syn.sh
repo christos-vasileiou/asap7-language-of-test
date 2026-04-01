@@ -20,7 +20,6 @@ DATASET="${3:-${DATASET:-freeset}}"  # freeset / metrex / shailja
 LIBRARY="${4:-${LIBRARY:-asap7sc7p5t_28}}"  # asap7sc7p5t_28
 export LIB_VARIANT PVT_CORNER DATASET LIBRARY
 
-
 mkdir -p /home/cxv200006/work/transformers_atpg/data/${DATASET}/structural.v.${DATASET,,}.${LIBRARY,,}.${LIB_VARIANT,,}.${PVT_CORNER,,}
 
 scontrol show job $SLURM_JOB_ID | grep -E "NumNodes|NumCPUs|NumTasks"
