@@ -22,6 +22,7 @@ import multiprocessing as mp
 import copy
 from utils import best_match
 from pathlib import Path
+from typing import Dict, List, Tuple
 from sympy import symbols
 from sympy.parsing.sympy_parser import parse_expr
 from sympy.core.symbol import Symbol
@@ -32,14 +33,17 @@ import json
 import shutil
 
 # Extracted modules
-from netlist_utils import verify_module_name
+from netlist_utils import Gate, Netlist, parse_range, get_net_length, expand_nets, verify_module_name
 from fault_sim import (
+  float_cols_to_int_with_x,
+  is_every_net_evaluated,
+  convert_string_to_dict,
   _compiled_gate_cache,
   get_compiled_func,
   OptimizedNetlist,
   fast_fault_sim,
 )
-from df_format import df_to_json
+from df_format import df_to_json, df_to_compact_markdown
 
 
 def process(x, base_prompt_dict, optimized_netlist, module_name, tetramax_folder, gate_func):
@@ -354,6 +358,9 @@ if __name__ == '__main__':
     
     config_dump = {
         "gate_funcs": serializable_gate_func,
+        "system_prompts": _system_prompts,
+        "user_prompts": _training_prompts_faults_list,
+        "assistant_prompts": _cot_assistant_response_faults_list,
     }
     with open(args.export_config, 'w') as f:
       json.dump(config_dump, f, indent=2)

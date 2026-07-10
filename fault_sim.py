@@ -4,9 +4,11 @@ fault_sim.py
 
 Fault simulation engine for structural Verilog netlists.
 
-Provides the ``OptimizedNetlist`` class for parsing gate-level netlists and
-the ``fast_fault_sim`` function that performs good-machine vs. bad-machine
-(stuck-at fault) simulation and returns a comparison DataFrame.
+Provides the ``OptimizedNetlist`` class for parsing gate-level netlists,
+the ``fast_fault_sim`` function for Python good/bad machine simulation, and
+:class:`TetraMaxFaultSimulator` / :func:`tetramax_fault_sim` for Synopsys
+TetraMAX batch artifacts and optional ``tmax`` invocation (set
+``FAULT_SIM_BACKEND=tetramax`` or ``hybrid``).
 
 Optimizations over the naive single-pass approach:
   1. Gate functions are pre-compiled to lookup tables (LUTs) during
@@ -21,11 +23,19 @@ Optimizations over the naive single-pass approach:
      SymPy dicts are all handled transparently.
 """
 
+import hashlib
+import json
+import os
+import re as std_re
+import shutil
+import subprocess
+import tempfile
+from collections import deque
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import pandas as pd
 import regex as re
-import json
-from collections import deque
-from typing import Dict, List, Tuple, Optional, Union
 
 from sympy import symbols, lambdify, parse_expr
 from sympy.core.symbol import Symbol
@@ -411,6 +421,7 @@ def fast_fault_sim(
   fault: str,
   optimized_netlist: OptimizedNetlist,
   gate_func = None,
+  module_name: Optional[str] = None,
   return_rewards: bool = False,
 ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, bool]]]:
   """
@@ -684,3 +695,319 @@ def fast_fault_sim(
   if return_rewards:
     return simulation, rewards
   return simulation
+
+
+# ============================================================
+# TetraMAX fault simulation (ASAP7 / language-of-test)
+# ============================================================
+#
+# Dataset construction (final_dataset_creation.py):
+#   1. TetraMAX ``run_fault_sim`` per ATPG pattern → ``detected_faults`` CSV
+#   2. Python :func:`fast_fault_sim` per detected fault → ``snapshot`` field
+#
+# GRPO / tool rewards on *model-generated* vectors should re-run TetraMAX for
+# authoritative detection; snapshots stay on :func:`fast_fault_sim` for speed and
+# schema compatibility with training records.
+
+TETRAMAX_FAULT_STATUS_DETECTED = "DS"
+TETRAMAX_FAULT_RE = re.compile(r"sa(\d)\s+(.+)", re.IGNORECASE)
+TETRAMAX_FAULT_SIM_STATS_RE = std_re.compile(
+  r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)%",
+  std_re.MULTILINE,
+)
+_DATA_PREPROCESSING_DIR = Path(__file__).resolve().parent
+_ASAP7_GATE_FUNC = _DATA_PREPROCESSING_DIR / "sim_config.json"
+_TMAX_VECTOR_TCL = _DATA_PREPROCESSING_DIR / "scripts" / "tmax_vector_fault_sim.tcl"
+
+
+def fault_sim_backend() -> str:
+  """
+  ``fast`` — Python only (default).
+  ``tetramax`` — run Synopsys TetraMAX for detection; Python for snapshot table.
+  ``hybrid`` — same as tetramax when ``tmax`` is on PATH, else fast.
+  """
+  return os.environ.get("FAULT_SIM_BACKEND", "fast").strip().lower()
+
+
+def _use_tetramax_backend() -> bool:
+  mode = fault_sim_backend()
+  if mode == "fast":
+    return False
+  if mode in ("tetramax", "hybrid"):
+    from tmax import infer_tmax_binary
+    return shutil.which(infer_tmax_binary()) is not None
+  return False
+
+
+def parse_tetramax_fault(fault: str) -> Tuple[int, str]:
+  match = TETRAMAX_FAULT_RE.match(fault.strip())
+  if not match:
+    raise ValueError(f"Invalid TetraMAX fault descriptor: {fault!r}")
+  return int(match.group(1)), match.group(2).strip()
+
+
+def parse_detected_faults_list(raw: Union[str, List[str], None]) -> List[str]:
+  if raw is None:
+    return []
+  if isinstance(raw, list):
+    return [str(f).strip() for f in raw if str(f).strip()]
+  text = str(raw).strip()
+  if not text:
+    return []
+  parts = re.split(r",\s*(?=sa)", text, flags=re.IGNORECASE)
+  return [p.strip() for p in parts if p.strip()]
+
+
+def parse_vector_field(raw: Union[str, Dict[str, Any]]) -> Dict[str, int]:
+  if isinstance(raw, dict):
+    return {str(k): int(v) for k, v in raw.items()}
+  text = str(raw).strip()
+  if text.startswith("{"):
+    return {str(k): int(v) for k, v in json.loads(text).items()}
+  sep = ":" if ":" in text else "="
+  return convert_string_to_dict(text, sep=sep)
+
+
+def _normalize_fault_key(fault: str) -> str:
+  stuck, net = parse_tetramax_fault(fault)
+  return f"sa{stuck} {net}"
+
+
+def parse_tetramax_detected_faults(path: Union[str, Path]) -> pd.DataFrame:
+  return pd.read_csv(
+    path, sep=r"\s+", header=None, names=["fault_type", "status", "net"]
+  )
+
+
+def detected_faults_from_csv(
+  path: Union[str, Path], status: str = TETRAMAX_FAULT_STATUS_DETECTED
+) -> List[str]:
+  df = parse_tetramax_detected_faults(path)
+  mask = df["status"].astype(str).str.upper() == status.upper()
+  rows = df.loc[mask, ["fault_type", "net"]]
+  return [_normalize_fault_key(f"{ft} {net}") for ft, net in rows.itertuples(index=False, name=None)]
+
+
+def asap7_cell_libs(use_asap7_28: bool = True) -> Tuple[str, str]:
+  """Return (verilog_paths, liberty_paths) as space-separated strings for TetraMAX env."""
+  from tmax import cell_liberty_paths_from_env_or_kit, cell_verilog_paths_from_env_or_kit
+
+  v = cell_verilog_paths_from_env_or_kit(_DATA_PREPROCESSING_DIR, use_asap7_28=use_asap7_28)
+  try:
+    lib = cell_liberty_paths_from_env_or_kit(_DATA_PREPROCESSING_DIR, use_asap7_28=use_asap7_28)
+  except FileNotFoundError:
+    lib = []
+  return " ".join(v), " ".join(lib)
+
+
+class TetraMaxFaultSimulator:
+  """Run TetraMAX vector fault simulation and parse detected-fault artifacts."""
+
+  def __init__(
+    self,
+    detected_faults: Optional[Union[str, List[str]]] = None,
+    *,
+    design_output_dir: Optional[Union[str, Path]] = None,
+    pattern_idx: int = 0,
+  ):
+    self.design_output_dir = (
+      Path(design_output_dir) if design_output_dir is not None else None
+    )
+    self.pattern_idx = int(pattern_idx)
+    self._detected_list: List[str] = []
+    self._detected_set: set = set()
+    if detected_faults is not None:
+      self._set_detected(parse_detected_faults_list(detected_faults))
+
+  def _set_detected(self, faults: List[str]) -> None:
+    self._detected_list = [_normalize_fault_key(f) for f in faults]
+    self._detected_set = set(self._detected_list)
+
+  @classmethod
+  def from_record(cls, record: Dict[str, Any], pattern_idx: int = 0) -> "TetraMaxFaultSimulator":
+    return cls(detected_faults=record.get("detected_faults"), pattern_idx=pattern_idx)
+
+  def _detected_faults_path(self) -> Path:
+    assert self.design_output_dir is not None
+    return (
+      self.design_output_dir
+      / "simulation"
+      / "bad"
+      / f"machine_detected_faults_{self.pattern_idx}.csv"
+    )
+
+  def is_fault_detected(self, fault: str) -> bool:
+    return _normalize_fault_key(fault) in self._detected_set
+
+  def run_vector_fault_sim(
+    self,
+    verilog_text: str,
+    input_vector: Union[str, Dict[str, int]],
+    *,
+    module_name: str = "design",
+    pi_order: Optional[List[str]] = None,
+    work_dir: Optional[Union[str, Path]] = None,
+    tmax_bin: Optional[str] = None,
+    timeout_s: Optional[int] = None,
+    use_asap7_28: bool = True,
+  ) -> List[str]:
+    """
+    Load ``verilog_text`` in TetraMAX, apply ``input_vector``, run ``run_fault_sim``.
+
+    Returns detected fault strings (``saX net`` with status DS).
+    """
+    from tetramax_stil import write_vector_stil
+    from tmax import build_env, infer_tmax_binary
+
+    if not _TMAX_VECTOR_TCL.is_file():
+      raise FileNotFoundError(f"TetraMAX Tcl not found: {_TMAX_VECTOR_TCL}")
+
+    inputs = parse_vector_field(input_vector)
+    if pi_order is None:
+      raise ValueError("pi_order is required (use OptimizedNetlist.input_nets)")
+
+    cleanup = work_dir is None
+    if work_dir is None:
+      work_dir = Path(tempfile.mkdtemp(prefix="tmax_fault_sim_"))
+    else:
+      work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    design_name = module_name or "design"
+    design_dir = work_dir / design_name
+    design_dir.mkdir(parents=True, exist_ok=True)
+    verilog_path = design_dir / f"{design_name}.v"
+    verilog_path.write_text(verilog_text, encoding="utf-8")
+    stil_path = design_dir / "vector.stil"
+    write_vector_stil(stil_path, pi_order, inputs)
+
+    cell_v, liberty_v = asap7_cell_libs(use_asap7_28=use_asap7_28)
+    env = build_env(
+      str(verilog_path.resolve()),
+      work_dir,
+      cell_v,
+      cell_libs_liberty=liberty_v,
+      stil_file=str(stil_path.resolve()),
+      pattern_idx=self.pattern_idx,
+    )
+    bin_name = tmax_bin or infer_tmax_binary()
+    cmd = [bin_name, "-shell", "-tcl", str(_TMAX_VECTOR_TCL.resolve())]
+
+    from tetramax_seats import run_tmax_subprocess
+
+    try:
+      run_tmax_subprocess(
+        cmd,
+        env=env,
+        cwd=str(design_dir),
+        timeout_s=timeout_s,
+      )
+    except subprocess.CalledProcessError as exc:
+      raise RuntimeError(
+        f"TetraMAX failed (exit {exc.returncode}): {exc.stderr or exc.stdout}"
+      ) from exc
+    except TimeoutError as exc:
+      raise RuntimeError(str(exc)) from exc
+    finally:
+      if cleanup:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    self.design_output_dir = design_dir
+    detected = detected_faults_from_csv(self._detected_faults_path())
+    self._set_detected(detected)
+    return detected
+
+
+def tetramax_fault_sim(
+  input_nets_and_vector: Union[str, Dict[str, int]],
+  expected_output_nets_and_vector: Union[str, Dict[str, int]],
+  fault: str,
+  optimized_netlist: OptimizedNetlist,
+  gate_func=None,
+  *,
+  tetramax_simulator: Optional[TetraMaxFaultSimulator] = None,
+  detected_faults: Optional[Union[str, List[str]]] = None,
+  module_name: Optional[str] = None,
+  run_tetramax: Optional[bool] = None,
+  require_tetramax_detection: bool = False,
+  return_rewards: bool = False,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Dict[str, Any]]]:
+  """
+  Fault simulation aligned with the language-of-test EDA flow.
+
+  When TetraMAX is enabled, runs ``run_fault_sim`` on the supplied PI vector and
+  checks that ``fault`` appears in the detected-fault list.  Good/bad snapshots
+  are still computed with :func:`fast_fault_sim` (same schema as the dataset).
+  """
+  rewards_extra: Dict[str, Any] = {
+    "tetramax_available": False,
+    "tetramax_detected": None,
+  }
+
+  tmax_sim = tetramax_simulator
+  if tmax_sim is None and detected_faults is not None:
+    tmax_sim = TetraMaxFaultSimulator(detected_faults=detected_faults)
+
+  do_tmax = run_tetramax if run_tetramax is not None else _use_tetramax_backend()
+  if do_tmax:
+    if tmax_sim is None:
+      tmax_sim = TetraMaxFaultSimulator()
+    if not tmax_sim._detected_set:
+      try:
+        from tetramax_seats import detection_cache_key, get_detection_cache
+
+        inputs = (
+          input_nets_and_vector
+          if isinstance(input_nets_and_vector, dict)
+          else parse_vector_field(input_nets_and_vector)
+        )
+        cache = get_detection_cache()
+        ck = detection_cache_key(optimized_netlist.netlist, inputs, fault)
+        cached = cache.get(ck)
+        if cached is not None:
+          tmax_sim._set_detected(cached)
+        else:
+
+          def _run():
+            return tmax_sim.run_vector_fault_sim(
+              optimized_netlist.netlist,
+              inputs,
+              module_name=module_name or "design",
+              pi_order=list(optimized_netlist.input_nets),
+            )
+
+          detected = _run()
+          cache.set(ck, detected)
+      except Exception as exc:
+        if fault_sim_backend() == "tetramax":
+          err = pd.DataFrame([{"error": f"TetraMAX simulation failed: {exc}"}])
+          return (err, rewards_extra) if return_rewards else err
+        # hybrid: fall back to Python snapshot-only when TetraMAX is unavailable
+
+  if tmax_sim is not None and tmax_sim._detected_set:
+    rewards_extra["tetramax_available"] = True
+    rewards_extra["tetramax_detected"] = tmax_sim.is_fault_detected(fault)
+    if require_tetramax_detection and not rewards_extra["tetramax_detected"]:
+      err = pd.DataFrame(
+        [{"error": f"fault not detected by TetraMAX: {fault}"}]
+      )
+      return (err, rewards_extra) if return_rewards else err
+
+  result = fast_fault_sim(
+    input_nets_and_vector,
+    expected_output_nets_and_vector,
+    fault,
+    optimized_netlist=optimized_netlist,
+    gate_func=gate_func,
+    return_rewards=return_rewards,
+  )
+  if not return_rewards:
+    return result
+  simulation, rewards = result
+  rewards.update(rewards_extra)
+  return simulation, rewards
+
+
+def resolve_fault_sim_runner():
+  """Return ``tetramax_fault_sim`` or ``fast_fault_sim`` per ``FAULT_SIM_BACKEND``."""
+  return tetramax_fault_sim if _use_tetramax_backend() else fast_fault_sim

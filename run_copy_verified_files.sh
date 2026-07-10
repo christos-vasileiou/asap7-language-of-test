@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=64              # Request 64 CPUs per task
 #SBATCH --mem=128G                       # Request 128GB of memory
 #SBATCH --partition=normal
+
 #
 # Script to copy verified verilog and json files with unique index prefix
 # 

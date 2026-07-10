@@ -23,13 +23,84 @@ def split_env_path_list(s: str) -> list[str]:
     return [p for p in (x.strip() for x in s.split()) if p]
 
 
-def build_env(verilog_file: str, output_dir: Path, cell_libs_verilog: str) -> dict:
-    """Build env for tmax.tcl. Copies the parent environment; sets design + lib paths."""
+def _lib_paths_asap7_liberty(
+    lib_dir: Path, categories: list[str], variant: str, pvt: str
+) -> list[Path]:
+    """Glob Liberty CCS files: asap7sc7p5t_{CAT}_{VARIANT}_{PVT}_*.lib"""
+    paths: list[Path] = []
+    for cat in categories:
+        pattern = f"asap7sc7p5t_{cat}_{variant}_{pvt}_*.lib"
+        matches = sorted(lib_dir.glob(pattern))
+        if not matches:
+            raise FileNotFoundError(
+                f"No Liberty library matching {pattern!r} under {lib_dir}"
+            )
+        paths.append(matches[-1] if len(matches) > 1 else matches[0])
+    return paths
+
+
+def resolve_liberty_paths(data_preprocessing_dir: Path, use_asap7_28: bool) -> list[str]:
+    """
+    Return absolute paths to ASAP7 Liberty (.lib) libraries for SEQ cell-name scan.
+
+    Used by TetraMAX Tcl (``CELL_LIBS_LIBERTY``); not passed to ``read_netlist``.
+    """
+    categories = ["AO", "OA", "INVBUF", "SEQ", "SIMPLE"]
+    variant = os.environ.get("LIB_VARIANT", "RVT")
+    pvt = os.environ.get("PVT_CORNER", "TT")
+
+    if use_asap7_28:
+        lib_dir = (data_preprocessing_dir / "lib" / "asap7sc7p5t_28" / "LIB" / "CCS").resolve()
+        paths = _lib_paths_asap7_liberty(lib_dir, categories, variant, pvt)
+    else:
+        lib_dir = (data_preprocessing_dir / "lib" / "asap7sc7p5t_24" / "LIB" / "CCS").resolve()
+        paths = _lib_paths_asap7_liberty(lib_dir, categories, variant, pvt)
+
+    missing = [p for p in paths if not p.is_file()]
+    if missing:
+        names = ", ".join(p.name for p in missing)
+        raise FileNotFoundError(f"Missing Liberty file(s): {names}")
+
+    return [str(p.resolve()) for p in paths]
+
+
+def cell_liberty_paths_from_env_or_kit(
+    data_preprocessing_dir: Path,
+    use_asap7_28: bool,
+) -> list[str]:
+    """Liberty paths from ``CELL_LIBS_LIBERTY`` or bundled ASAP7 kit."""
+    raw = os.environ.get("CELL_LIBS_LIBERTY", "").strip()
+    if raw:
+        paths = split_env_path_list(raw)
+        missing = [p for p in paths if not Path(p).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"CELL_LIBS_LIBERTY entries not found: {missing!r}"
+            )
+        return [str(Path(p).resolve()) for p in paths]
+    return resolve_liberty_paths(data_preprocessing_dir, use_asap7_28)
+
+
+def build_env(
+    verilog_file: str,
+    output_dir: Path,
+    cell_libs_verilog: str,
+    *,
+    cell_libs_liberty: str = "",
+    stil_file: str = "",
+    pattern_idx: int = 0,
+) -> dict:
+    """Build env for TetraMAX Tcl drivers. Copies the parent environment."""
     env = os.environ.copy()
     env["VERILOG_FILE"] = verilog_file
     env["OUTPUT_DIR"] = str(output_dir.resolve())
     env["CELL_LIBS_VERILOG"] = cell_libs_verilog
     env["LIBS"] = cell_libs_verilog
+    if cell_libs_liberty:
+        env["CELL_LIBS_LIBERTY"] = cell_libs_liberty
+    if stil_file:
+        env["STIL_FILE"] = stil_file
+    env["PATTERN_IDX"] = str(int(pattern_idx))
     return env
 
 

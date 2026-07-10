@@ -39,18 +39,21 @@ if { [info exists env(DESIGN)] && $env(DESIGN) ne "" } {
     exit 1
 }
 
-read_verilog $verilog_files -rtl
+if { [catch { read_verilog $verilog_files -rtl } err_msg] } {
+    puts "Error: read_verilog failed: $err_msg"
+    exit 1
+}
 
 # link the design to the specified libraries
-link
+if { [catch { link } err_msg] } {
+    puts "Error: link failed: $err_msg"
+    exit 1
+}
 
-# check for unmapped logic
-#if {[check_design -unmapped -no_warnings] != 1} {
-#    puts "Error: design contains unmapped logic"
-#    exit 2
-#}
+if { [catch { check_design } err_msg] } {
+    puts "Warning: check_design raised: $err_msg"
+}
 
-# Make unique copies of re-used submodules so they can be flattened independently
 uniquify
 
 # FLATTEN EVERYTHING under the current_design
@@ -91,9 +94,15 @@ if { [llength $clock_ports] > 0 } {
     puts "Info: This may be intentional for combinational-only designs."
 }
 
-compile_ultra
+if { [catch { compile_ultra } err_msg] } {
+    puts "Error: compile_ultra failed: $err_msg"
+    exit 1
+}
 
-write -format verilog -hierarchy -output $env(RESULTS_DIR)/${top_design}.v
+if { [catch { write -format verilog -hierarchy -output $env(RESULTS_DIR)/${top_design}.v } err_msg] } {
+    puts "Error: write netlist failed: $err_msg"
+    exit 1
+}
 # write -format ddc     -hierarchy -output $env(RESULTS_DIR)/${top_design}.ddc
 # write -format ndm     -hierarchy -output $env(RESULTS_DIR)/${top_design}.ndm
 

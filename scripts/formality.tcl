@@ -11,21 +11,31 @@ remove_container r
 remove_container i
 
 # Read original RTL as reference (r = reference, the golden design)
-# Construct RTL file path from RTL_PATH directory
 set rtl_file [file join $env(RTL_PATH) design.v]
-read_verilog -container r -libname WORK -05 $rtl_file
+if { [catch { read_verilog -container r -libname WORK -05 $rtl_file } err_msg] } {
+    puts "Error: Failed to read reference RTL: $err_msg"
+    exit 1
+}
 set_top r:/WORK/$env(DESIGN)
 read_db [ split $env(DBS) ]
 
 # Read synthesized netlist as implementation (i = implementation, to verify against reference)
-read_verilog -container i -libname WORK -05 $env(SYNTHESIZED_FILE)
+if { [catch { read_verilog -container i -libname WORK -05 $env(SYNTHESIZED_FILE) } err_msg] } {
+    puts "Error: Failed to read synthesized netlist: $err_msg"
+    exit 1
+}
 set_top i:/WORK/$env(DESIGN)
 
-# Set verification limits
 set verification_failing_point_limit 1
 
-# Run verification
 match
-verify
+
+set verify_status [verify]
 cputime
+
+if { $verify_status != 1 } {
+    puts "Verification FAILED"
+    exit 1
+}
+
 exit

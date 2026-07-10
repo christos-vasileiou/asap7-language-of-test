@@ -164,7 +164,7 @@ set design_output_dir [file join $output_dir $design_name]
 file mkdir $design_output_dir
 
 # Small delay (workaround for filesystem or tool startup ordering in some environments)
-after 50
+after 10
 
 # -----------------------------------------------------------------------------
 # Block: Configure netlist mode from combinational vs sequential detection
@@ -269,14 +269,15 @@ if {$is_seq} {
 # Block: 6 — Run ATPG (single detection per fault for this script)
 # -----------------------------------------------------------------------------
 set atpg_output_file [file join $design_output_dir "atpg.txt"]
+set_atpg -norandom_fill
 run_atpg -ndetects 1 > $atpg_output_file
-  
+
 # -----------------------------------------------------------------------------
 # Block: 7 — Dump generated test patterns (internal form) to patterns.txt
 # -----------------------------------------------------------------------------
 set patterns_output_file [file join $design_output_dir "patterns.txt"]
 report_patterns -all -internal > $patterns_output_file
-  
+
 # -----------------------------------------------------------------------------
 # Block: 8 — Fault coverage / fault list report
 # -----------------------------------------------------------------------------
@@ -391,11 +392,11 @@ for {set i 3} {$i < [llength $lines]} {incr i} {
     # Output directories for this pattern index
     set badMSdir [file join $design_output_dir "simulation/bad/"]
     file mkdir $badMSdir
-    after 50
+    after 10
       
     set goodMSdir [file join $design_output_dir "simulation/good/"]
     file mkdir $goodMSdir
-    after 50
+    after 10
 
     # Good machine: no fault injection — expected "golden" behavior
     set goodMSFile [file join $goodMSdir "machine_${count}.txt"]
@@ -427,9 +428,9 @@ if {$is_seq} {
 set_drc -nofile
 drc -force >> .temp.txt
 read_netlist -delete >> .temp.txt
-#rm .temp.txt
+rm .temp.txt
 
-#rm -rf '/proj/txace/cxv200006/transformers_atpg/.split_patterns/'
+after 10
 
 puts "\n\nATPG process completed.\n\n"
 quit
