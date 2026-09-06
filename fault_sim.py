@@ -477,7 +477,9 @@ def fast_fault_sim(
 
   # ---- Initialise machines ------------------------------------------
   good_machine = input_nets_and_vector.copy()
-  good_machine.update(expected_output_nets_and_vector)
+  # Expected-output values are model claims, not simulation inputs. Their keys
+  # identify primary outputs, but seeding their values here can fabricate a
+  # detection when the circuit cannot evaluate an output.
 
   bad_machine = input_nets_and_vector.copy()
   bad_machine[faulty_net] = faulty_value
