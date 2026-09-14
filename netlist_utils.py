@@ -97,6 +97,33 @@ def expand_nets(nets: dict) -> list:
   return expanded_nets
 
 
+def declared_nets(verilog_text, keyword, decl_re, name_re):
+  """Expand actual declared indices, in ascending canonical simulator order.
+
+  Unlike width-only expansion, [9:8] yields [8], [9], not [0], [1].
+  Unpacked indices precede packed indices in a Verilog array element.
+  """
+  def indices(bounds):
+    if not bounds:
+      return [None]
+    a, b = map(int, re.findall(r'-?\d+', bounds))
+    return range(min(a, b), max(a, b) + 1)
+
+  result = []
+  for declaration in decl_re.finditer(verilog_text):
+    if declaration.group('kind') != keyword:
+      continue
+    for token in declaration.group('rest').split(','):
+      name = name_re.fullmatch(token)
+      if name is None:
+        raise ValueError(f"Unsupported {keyword} declaration: {token}")
+      for unpacked in indices(name.group('unpacked')):
+        for packed in indices(declaration.group('packed')):
+          suffix = ''.join(f'[{i}]' for i in (unpacked, packed) if i is not None)
+          result.append(name.group('name') + suffix)
+  return result
+
+
 # ============================================================
 # Module-name verification
 # ============================================================

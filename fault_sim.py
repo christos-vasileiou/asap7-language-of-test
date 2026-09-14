@@ -40,7 +40,7 @@ import regex as re
 from sympy import symbols, lambdify, parse_expr
 from sympy.core.symbol import Symbol
 
-from netlist_utils import expand_nets, get_net_length
+from netlist_utils import expand_nets, get_net_length, declared_nets
 
 
 # ============================================================
@@ -257,11 +257,13 @@ class OptimizedNetlist:
     gate_func = _normalize_gate_func(gate_func)
 
     # Cache net lists
-    self.input_nets = expand_nets(get_net_length(verilog_text, "input", decl_re, name_re))
-    self.output_nets = expand_nets(get_net_length(verilog_text, "output", decl_re, name_re))
+    self.input_nets = declared_nets(verilog_text, "input", decl_re, name_re)
+    self.output_nets = declared_nets(verilog_text, "output", decl_re, name_re)
 
     self.netlist = verilog_text
     self.instructions = []
+    # Dataset explanations need cell/instance metadata, not compiled LUT tuples.
+    self.gate_metadata = []
     self.net_dependencies = {}        # net → set of nets it depends on
 
     self._parse_and_compile(verilog_text, gate_func)
@@ -323,6 +325,7 @@ class OptimizedNetlist:
       for out_p in out_ports:
         out_net   = connections[out_p]
         input_map = {p: connections[p] for p in in_ports}
+        self.gate_metadata.append((gate_type, instance, out_p, out_net, input_map))
 
         # Compile the gate function (LUT or callable)
         lut_or_fn, sym_names = _compile_gate_port(gate_type, out_p, gate_func)
