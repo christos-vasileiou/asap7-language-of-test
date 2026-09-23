@@ -16,6 +16,7 @@ import sys
 import argparse
 import shutil
 import subprocess
+from tetramax_seats import run_tmax_subprocess, SimulationError
 from pathlib import Path
 
 
@@ -153,7 +154,8 @@ def resolve_structural_lib_paths(data_preprocessing_dir: Path, use_asap7_28: boo
     pvt = os.environ.get("PVT_CORNER", "TT")
 
     if use_asap7_28:
-        lib_dir = (data_preprocessing_dir / "lib" / "asap7sc7p5t_28" / "verilog").resolve()
+        kit = data_preprocessing_dir / "lib" / "asap7sc7p5t_28"
+        lib_dir = (kit / ("Verilog" if (kit / "Verilog").is_dir() else "verilog")).resolve()
         paths = _lib_paths_asap7_28(lib_dir, categories, variant, pvt)
     else:
         lib_dir = (data_preprocessing_dir / "lib" / "asap7sc7p5t_24" / "verilog").resolve()
@@ -285,10 +287,15 @@ def main(argv: list[str]) -> int:
             print("CELL_LIBS_LIBERTY=", liberty_raw)
 
         try:
-            subprocess.run(cmd, check=True, env=env)
+            result = run_tmax_subprocess(cmd, env=env, cwd=str(output_dir.resolve()))
+            print(result.stdout, end='')
+            print(result.stderr, end='', file=sys.stderr)
         except subprocess.CalledProcessError as exc:
             print(f"TetraMAX failed with return code {exc.returncode}", file=sys.stderr)
             return exc.returncode or 1
+        except SimulationError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         except FileNotFoundError:
             print(f"Error: TetraMAX binary not found: {tmax_bin}", file=sys.stderr)
             return 127
