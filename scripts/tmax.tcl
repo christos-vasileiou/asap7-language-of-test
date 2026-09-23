@@ -24,26 +24,26 @@
 set verilog_dir [pwd]
 
 proc split_space_separated_paths {raw} {
-  set out {}
-  foreach x [split $raw " "] {
-    set t [string trim $x]
-    if {$t ne ""} {
-      lappend out $t
+    set out {}
+    foreach x [split $raw " "] {
+        set t [string trim $x]
+        if {$t ne ""} {
+        lappend out $t
+        }
     }
-  }
-  return $out
+    return $out
 }
 
 # -----------------------------------------------------------------------------
 # Block: Cell-library Verilog list (structural .v only) for read_netlist -library
 # -----------------------------------------------------------------------------
 if {[info exists env(CELL_LIBS_VERILOG)] && [string trim $env(CELL_LIBS_VERILOG)] ne ""} {
-  set libs_list [split_space_separated_paths $env(CELL_LIBS_VERILOG)]
+    set libs_list [split_space_separated_paths $env(CELL_LIBS_VERILOG)]
 } elseif {[info exists env(LIBS)] && [string trim $env(LIBS)] ne ""} {
-  set libs_list [split_space_separated_paths $env(LIBS)]
+    set libs_list [split_space_separated_paths $env(LIBS)]
 } else {
-  puts "Error: Set CELL_LIBS_VERILOG (preferred) or LIBS to space-separated structural cell-library Verilog (.v) paths."
-  exit 1
+    puts "Error: Set CELL_LIBS_VERILOG (preferred) or LIBS to space-separated structural cell-library Verilog (.v) paths."
+    exit 1
 }
 
 # -----------------------------------------------------------------------------
@@ -54,28 +54,28 @@ if {[info exists env(CELL_LIBS_VERILOG)] && [string trim $env(CELL_LIBS_VERILOG)
 # -----------------------------------------------------------------------------
 set seq_lib ""
 if {[info exists env(SEQ_LIB)] && [string trim $env(SEQ_LIB)] ne ""} {
-  set seq_lib [string trim $env(SEQ_LIB)]
+    set seq_lib [string trim $env(SEQ_LIB)]
 } elseif {[info exists env(CELL_LIBS_LIBERTY)] && [string trim $env(CELL_LIBS_LIBERTY)] ne ""} {
-  foreach lib [split_space_separated_paths $env(CELL_LIBS_LIBERTY)] {
-    if {[string match {*SEQ*} $lib]} {
-      set seq_lib $lib
-      break
+    foreach lib [split_space_separated_paths $env(CELL_LIBS_LIBERTY)] {
+        if {[string match {*SEQ*} $lib]} {
+            set seq_lib $lib
+            break
+        }
     }
-  }
 }
 if {$seq_lib eq ""} {
-  foreach lib $libs_list {
-    if {[string match {*SEQ*} $lib]} {
-      set seq_lib $lib
-      break
+    foreach lib $libs_list {
+        if {[string match {*SEQ*} $lib]} {
+            set seq_lib $lib
+            break
+        }
     }
-  }
 }
 
 if {$seq_lib eq "" || ![file exists $seq_lib]} {
-  puts "Error: No sequential library reference for cell-name scan."
-  puts "  Set SEQ_LIB, or include a path matching *SEQ* in CELL_LIBS_LIBERTY or CELL_LIBS_VERILOG."
-  exit 1
+    puts "Error: No sequential library reference for cell-name scan."
+    puts "  Set SEQ_LIB, or include a path matching *SEQ* in CELL_LIBS_LIBERTY or CELL_LIBS_VERILOG."
+    exit 1
 }
 
 set fh [open $seq_lib r]
@@ -88,9 +88,9 @@ close $fh
 set cell_names {}
 
 if {[string equal -nocase [file extension $seq_lib] ".lib"]} {
-  set pattern {cell\s*\(\s*([^)]+?)\s*\)\s*\{}
+    set pattern {cell\s*\(\s*([^)]+?)\s*\)\s*\{}
 } else {
-  set pattern {module\s+([^(\s]+)\s*\(}
+    set pattern {module\s+([^(\s]+)\s*\(}
 }
 
 set start 0
@@ -125,23 +125,23 @@ set seq_stdcell_names_regex [join $escaped_names "|"]
 # Used to choose -sequential_modeling vs -nosequential_modeling for the netlist reader.
 # -----------------------------------------------------------------------------
 proc is_sequential_netlist {filePath} {
-  global seq_stdcell_names_regex
-  if {$seq_stdcell_names_regex eq ""} {
-    return 0
-  }
-  if {![file exists $filePath]} {
-    return 0
-  }
-  set fh [open $filePath r]
-  set data [read $fh]
-  close $fh
+    global seq_stdcell_names_regex
+    if {$seq_stdcell_names_regex eq ""} {
+        return 0
+    }
+    if {![file exists $filePath]} {
+        return 0
+    }
+    set fh [open $filePath r]
+    set data [read $fh]
+    close $fh
 
-  # Match any known sequential stdcell name as a whole token in the netlist
-  if {[regexp -nocase "\\y($seq_stdcell_names_regex)\\y" $data]} {
-    return 1
-  }
+    # Match any known sequential stdcell name as a whole token in the netlist
+    if {[regexp -nocase "\\y($seq_stdcell_names_regex)\\y" $data]} {
+        return 1
+    }
 
-  return 0
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -151,8 +151,8 @@ set output_dir $env(OUTPUT_DIR)
 set verilog_file $env(VERILOG_FILE)
 
 if {![file exists $verilog_file]} {
-  puts "Error: Verilog file '$verilog_file' does not exist"
-  exit 1
+    puts "Error: Verilog file '$verilog_file' does not exist"
+    exit 1
 }
 
 # Design name = basename of netlist without extension (used for output subdirectory)
@@ -176,10 +176,10 @@ after 10
 # -----------------------------------------------------------------------------
 set is_seq [is_sequential_netlist $verilog_file]
 if {$is_seq} {
-  set_netlist -sequential_modeling
-  quit
+    set_netlist -sequential_modeling
+    quit
 } else {
-  set_netlist -nosequential_modeling
+    set_netlist -nosequential_modeling
 }
 
 # -----------------------------------------------------------------------------
@@ -193,15 +193,15 @@ proc is_list {value} {
 
 # Liberty/timing sources cannot be loaded with read_netlist — fail fast with a clear message.
 proc assert_netlist_libs_only {paths} {
-  foreach p $paths {
-    if {$p eq ""} { continue }
-    set ext [file extension $p]
-    if {[string equal -nocase $ext ".lib"]} {
-      puts "Error: CELL_LIBS_VERILOG / LIBS must not include Liberty .lib files: $p"
-      puts "  read_netlist only accepts structural netlists (e.g. PDK cell .v). Put .lib in CELL_LIBS_LIBERTY."
-      exit 1
+    foreach p $paths {
+        if {$p eq ""} { continue }
+        set ext [file extension $p]
+        if {[string equal -nocase $ext ".lib"]} {
+            puts "Error: CELL_LIBS_VERILOG / LIBS must not include Liberty .lib files: $p"
+            puts "  read_netlist only accepts structural netlists (e.g. PDK cell .v). Put .lib in CELL_LIBS_LIBERTY."
+            exit 1
+        }
     }
-  }
 }
 
 # -----------------------------------------------------------------------------
@@ -212,13 +212,19 @@ proc assert_netlist_libs_only {paths} {
 # Errors are caught; some flows append messages to .temp5.tcl then remove it.
 # -----------------------------------------------------------------------------
 if {[is_list $libs_list]} {
-  assert_netlist_libs_only $libs_list
-  foreach lib $libs_list {
-    set read_result [catch {read_netlist $lib -library >> .temp5.tcl} error_msg]
-  }
+    assert_netlist_libs_only $libs_list
+    foreach lib $libs_list {
+        if {[catch {read_netlist $lib -library >> .temp5.tcl} error_msg]} {
+            puts stderr "Library read failed: $error_msg"
+            exit 1
+        }
+    }
 } else {
-  assert_netlist_libs_only [list $libs_list]
-  set read_result [catch {read_netlist $libs_list -library >> .temp5.tcl} error_msg]
+    assert_netlist_libs_only [list $libs_list]
+    if {[catch {read_netlist $libs_list -library >> .temp5.tcl} error_msg]} {
+        puts stderr "Library read failed: $error_msg"
+        exit 1
+    }
 } 
 
 # -----------------------------------------------------------------------------
@@ -228,7 +234,8 @@ set read_result [catch {read_netlist $verilog_file >> .temp5.tcl} error_msg]
 rm .temp5.tcl
 
 if {$read_result == 1} {
-  puts "Error reading $verilog_file: $error_msg"
+    puts stderr "Error reading $verilog_file: $error_msg"
+    exit 1
 }
 
 # -----------------------------------------------------------------------------
@@ -262,7 +269,7 @@ add_faults -all >> .temp.txt
   
 # For sequential ATPG (not reached if script quit earlier for is_seq): constrain ATPG
 if {$is_seq} {
-  set_atpg -full_seq_atpg -norandom_fill
+    set_atpg -full_seq_atpg -norandom_fill
 }
 
 # -----------------------------------------------------------------------------
@@ -342,84 +349,90 @@ set patterns {}
 set pattern ""
 set count 0
 for {set i 3} {$i < [llength $lines]} {incr i} {
-  append pattern [lindex $lines $i] "\n"
-  if {$i % 2 ==0} {
-    # Normalize pattern index inside this chunk to 0 (tool expects single pattern).
-    # Note: original flow stores regsub result in modifiedString but writes $pattern below;
-    # use $modifiedString in puts if the tool requires the rewritten index.
-    set modifiedString [regsub {pattern (\d+)} $pattern "pattern 0"]
+    append pattern [lindex $lines $i] "\n"
+    if {$i % 2 ==0} {
+        # Normalize pattern index inside this chunk to 0 (tool expects single pattern).
+        # Note: original flow stores regsub result in modifiedString but writes $pattern below;
+        # use $modifiedString in puts if the tool requires the rewritten index.
+        set modifiedString [regsub {pattern (\d+)} $pattern "pattern 0"]
 
-    # Write one minimal STIL: preamble + header + fixed lines + this pattern + closing brace
-    set tempFilename [file join $design_output_dir "temp.stil"]
-    # rm $tempFilename
-    set tempfile [open $tempFilename "w"]
-    puts $tempfile $beforePattern
-    puts $tempfile $commonPatternHeader
-    puts $tempfile $firstLine
-    puts $tempfile $secondLine
-    puts $tempfile $pattern
-    puts $tempfile "\}\n"
-    close $tempfile
+        # Write one minimal STIL: preamble + header + fixed lines + this pattern + closing brace
+        set tempFilename [file join $design_output_dir "temp.stil"]
+        # rm $tempFilename
+        set tempfile [open $tempFilename "w"]
+        puts $tempfile $beforePattern
+        puts $tempfile $commonPatternHeader
+        puts $tempfile $firstLine
+        puts $tempfile $secondLine
+        puts $tempfile $pattern
+        puts $tempfile "\}\n"
+        close $tempfile
 
-    set dumpNdeleteFile [file join $design_output_dir "temp.txt"]
+        set dumpNdeleteFile [file join $design_output_dir "temp.txt"]
 
-    # Reset TetraMAX netlist/pattern state and reload libs + design (combinational mode)
-    drc -force >> .temp.txt
-    read_netlist -delete >> .temp.txt
-    set_netlist -nosequential_modeling
-    
-    if {[is_list $libs_list]} {
-      foreach lib $libs_list {
-        set read_result [catch {read_netlist $lib -library >> .temp5.tcl} error_msg]
-      }
-    } else {
-      set read_result [catch {read_netlist $libs_list -library >> .temp5.tcl} error_msg]
+        # Reset TetraMAX netlist/pattern state and reload libs + design (combinational mode)
+        drc -force >> .temp.txt
+        read_netlist -delete >> .temp.txt
+        set_netlist -nosequential_modeling
+        
+        if {[is_list $libs_list]} {
+            foreach lib $libs_list {
+                if {[catch {read_netlist $lib -library >> .temp5.tcl} error_msg]} {
+                    puts stderr "Library read failed: $error_msg"
+                    exit 1
+                }
+            }
+        } else {
+            if {[catch {read_netlist $libs_list -library >> .temp5.tcl} error_msg]} {
+                puts stderr "Library read failed: $error_msg"
+                exit 1
+            }
+        }
+
+        read_netlist $verilog_file
+        set_build -nonet_connections_change_netlist -nodelete_unused_gates 
+        run_build_model > $dumpNdeleteFile
+        # Point DRC at the single-pattern STIL; run_drc accepts it as pattern protocol
+        set_drc $tempFilename
+        run_drc >> $dumpNdeleteFile
+        set_patterns -delete
+        set_patterns -external $tempFilename -sensitive
+        remove_faults -all >> .temp.txt
+        add_faults -all >> .temp.txt
+
+        rm $tempFilename
+
+        # Output directories for this pattern index
+        set badMSdir [file join $design_output_dir "simulation/bad/"]
+        file mkdir $badMSdir
+        after 10
+        
+        set goodMSdir [file join $design_output_dir "simulation/good/"]
+        file mkdir $goodMSdir
+        after 10
+
+        # Good machine: no fault injection — expected "golden" behavior
+        set goodMSFile [file join $goodMSdir "machine_${count}.txt"]
+        run_simulation > $goodMSFile
+        # Bad machine: fault simulation + which faults are detected for this pattern
+        set badMSFileFS [file join $badMSdir "machine_faults_sim_${count}.txt"]
+        set badMSFileDF [file join $badMSdir "machine_detected_faults_${count}.csv"]
+        run_fault_sim -ndetects 1 > $badMSFileFS
+        report_faults -all -collapsed > $badMSFileDF
+        
+        incr count
+        
+        lappend patterns $pattern
+        set pattern ""
+
+        rm $dumpNdeleteFile
+        set_drc -nofile
     }
-
-    read_netlist $verilog_file
-    set_build -nonet_connections_change_netlist -nodelete_unused_gates 
-    run_build_model > $dumpNdeleteFile
-    # Point DRC at the single-pattern STIL; run_drc accepts it as pattern protocol
-    set_drc $tempFilename
-    run_drc >> $dumpNdeleteFile
-    set_patterns -delete
-    set_patterns -external $tempFilename -sensitive
-    remove_faults -all >> .temp.txt
-    add_faults -all >> .temp.txt
-
-    rm $tempFilename
-
-    # Output directories for this pattern index
-    set badMSdir [file join $design_output_dir "simulation/bad/"]
-    file mkdir $badMSdir
-    after 10
-      
-    set goodMSdir [file join $design_output_dir "simulation/good/"]
-    file mkdir $goodMSdir
-    after 10
-
-    # Good machine: no fault injection — expected "golden" behavior
-    set goodMSFile [file join $goodMSdir "machine_${count}.txt"]
-    run_simulation > $goodMSFile
-    # Bad machine: fault simulation + which faults are detected for this pattern
-    set badMSFileFS [file join $badMSdir "machine_faults_sim_${count}.txt"]
-    set badMSFileDF [file join $badMSdir "machine_detected_faults_${count}.csv"]
-    run_fault_sim -ndetects 1 > $badMSFileFS
-    report_faults -all -collapsed > $badMSFileDF
-      
-    incr count
-      
-    lappend patterns $pattern
-    set pattern ""
-
-    rm $dumpNdeleteFile
-    set_drc -nofile
-  }
 }
 
 # Restore ATPG defaults if sequential mode had been enabled (unreachable if quit above)
 if {$is_seq} {
-  set_atpg -nofull_seq_atpg -random_fill
+    set_atpg -nofull_seq_atpg -random_fill
 }
 
 # -----------------------------------------------------------------------------

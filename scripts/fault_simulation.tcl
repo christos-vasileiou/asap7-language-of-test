@@ -1,16 +1,7 @@
-read_netlist $env(SYNTHESIZED_FILE)
-set libs_list [split $env(LIBS) " "]
-
-# 1. Read the default library
-if {[is_list $libs_list]} {
-  foreach lib $libs_list {
-    set read_result [catch {read_netlist $lib -library >> .temp5.tcl} error_msg]
-  }
-} else {
-  set read_result [catch {read_netlist $libs_list -library >> .temp5.tcl} error_msg]
-} 
-
-run_build_model
-run_drc
-
-
+# Compatibility entry point for the authoritative vector adapter.
+# Use tetramax_backend.py to generate REQUEST_FILE and supervise the licensed process.
+if {![info exists env(REQUEST_FILE)]} {
+    puts stderr "REQUEST_FILE is required; use tetramax_backend.py via fault_sim.py"
+    exit 1
+}
+source [file join [file dirname [info script]] tmax_vector_fault_sim.tcl]
