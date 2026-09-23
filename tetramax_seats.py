@@ -1,202 +1,212 @@
+"""One shared project pool, process-tree cleanup, and cancellation for TetraMAX.
+
+The default pool lives on the project filesystem, not per-node /tmp. One host
+owns execution; remote ranks use TMAX_SERVER_URL. All local entry points share
+its 16-slot allocation. A conflicting host/limit fails closed. Slot FDs are
+inherited by a watchdog so killing a client does not abandon licensed children.
 """
-Licensed-seat control for Synopsys TetraMAX subprocess invocations.
-
-TetraMAX holds a FlexLM (or similar) license for the lifetime of each ``tmax``
-process.  GRPO reward loops and evaluation can invoke fault simulation thousands
-of times; without caps, many ranks or completions can spawn concurrent ``tmax``
-processes and exhaust seats for long periods.
-
-Environment variables
----------------------
-TMAX_MAX_CONCURRENT
-    Maximum simultaneous ``tmax`` processes **on this host** (default ``1``).
-    Implemented with non-blocking ``fcntl`` locks on ``$TMAX_LOCK_DIR/seat_*.lock``.
-
-TMAX_LOCK_DIR
-    Directory for seat lock files (default ``/tmp/tmax_seats_<uid>``).
-
-TMAX_ACQUIRE_TIMEOUT_S
-    Seconds to wait for a free seat before failing (default ``1800``).  Set ``0``
-    to fail immediately if all seats are busy.
-
-TMAX_TIMEOUT_S
-    Per-invocation wall-clock limit for one ``tmax`` run (default ``600``).
-    The subprocess is killed on expiry so licenses are released.
-
-TMAX_RESULT_CACHE_SIZE
-    In-process LRU entries for ``(netlist, input_vector, fault) → detected list``.
-    Default ``0`` (disabled).  Safe per Python process (each DDP rank has its own
-    cache); does not share across nodes.
-"""
-
 from __future__ import annotations
-
-import fcntl
-import os
-import subprocess
-import time
+from collections import OrderedDict
 from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
 
 
-def _env_int(name: str, default: int) -> int:
-  raw = os.environ.get(name, "").strip()
-  if not raw:
-    return default
-  return int(raw)
+class SimulationError(RuntimeError):
+    """Infrastructure failure, never an ordinary negative model reward."""
 
 
-def max_concurrent_seats() -> int:
-  return max(1, _env_int("TMAX_MAX_CONCURRENT", 1))
+class SimulationCancelled(SimulationError):
+    pass
 
 
-def per_run_timeout_s() -> int:
-  return max(30, _env_int("TMAX_TIMEOUT_S", 600))
+def _number(name, default, minimum=0):
+    value = int(os.environ.get(name, default))
+    if value < minimum:
+        raise ValueError(f'{name} must be >= {minimum}')
+    return value
 
 
-def acquire_timeout_s() -> int:
-  return max(0, _env_int("TMAX_ACQUIRE_TIMEOUT_S", 1800))
+def max_concurrent_seats():
+    return _number('TMAX_MAX_CONCURRENT', 16)
 
 
-def result_cache_size() -> int:
-  return max(0, _env_int("TMAX_RESULT_CACHE_SIZE", 0))
+def per_run_timeout_s():
+    return _number('TMAX_TIMEOUT_S', 120, 1)
 
 
-def lock_dir() -> Path:
-  custom = os.environ.get("TMAX_LOCK_DIR", "").strip()
-  if custom:
-    p = Path(custom)
-  else:
-    p = Path(f"/tmp/tmax_seats_{os.getuid()}")
-  p.mkdir(parents=True, exist_ok=True)
-  for i in range(max_concurrent_seats()):
-    (p / f"seat_{i}.lock").touch()
-  return p
+def acquire_timeout_s():
+    return _number('TMAX_ACQUIRE_TIMEOUT_S', 120)
+
+
+def result_cache_size():
+    return _number('TMAX_RESULT_CACHE_SIZE', 1024)
+
+
+def lock_dir():
+    path = Path(os.environ.get('TMAX_LOCK_DIR', str(Path(__file__).resolve().parents[1] / '.runtime' / 'tetramax')))
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
+def write_state(path, data):
+    temporary = path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
+    temporary.write_text(json.dumps(data))
+    temporary.replace(path)
+
+
+def _pool(path, seats):
+    config = path / 'pool.json'
+    with (path / 'pool.lock').open('a+') as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        expected = {'host': socket.gethostname(), 'seats': seats}
+        if config.exists():
+            actual = json.loads(config.read_text())
+            if actual != expected:
+                raise SimulationError(f'TetraMAX pool belongs to {actual}; requested {expected}. '
+                                      'Remote clients must use TMAX_SERVER_URL; drain before reconfiguration.')
+        else:
+            tmp = config.with_suffix('.tmp')
+            tmp.write_text(json.dumps(expected))
+            tmp.replace(config)
 
 
 @contextmanager
-def acquire_tmax_seat(wait_timeout_s: Optional[int] = None) -> Iterator[None]:
-  """
-  Hold one TetraMAX license seat for the duration of the context.
-
-  Blocks until a seat is free or ``wait_timeout_s`` is exceeded.
-  """
-  if wait_timeout_s is None:
-    wait_timeout_s = acquire_timeout_s()
-
-  seats = max_concurrent_seats()
-  slot_dir = lock_dir()
-  deadline = time.monotonic() + wait_timeout_s if wait_timeout_s > 0 else time.monotonic()
-
-  held_fd = None
-  try:
-    while True:
-      for i in range(seats):
-        path = slot_dir / f"seat_{i}.lock"
-        fd = os.open(path, os.O_RDWR | os.O_CREAT)
-        try:
-          fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-          held_fd = fd
-          yield
-          return
-        except BlockingIOError:
-          os.close(fd)
-      if wait_timeout_s == 0 or time.monotonic() >= deadline:
-        raise TimeoutError(
-          f"No TetraMAX seat available within {wait_timeout_s}s "
-          f"(TMAX_MAX_CONCURRENT={seats}). Another job may be holding licenses."
-        )
-      time.sleep(0.25)
-  finally:
-    if held_fd is not None:
-      fcntl.flock(held_fd, fcntl.LOCK_UN)
-      os.close(held_fd)
-
-
-def run_tmax_subprocess(
-  cmd: List[str],
-  *,
-  env: dict,
-  cwd: str,
-  timeout_s: Optional[int] = None,
-  acquire_wait_s: Optional[int] = None,
-) -> subprocess.CompletedProcess:
-  """
-  Run ``tmax`` under a seat lock with a hard timeout (kill on expiry).
-  """
-  if timeout_s is None:
-    timeout_s = per_run_timeout_s()
-
-  with acquire_tmax_seat(wait_timeout_s=acquire_wait_s):
-    proc = subprocess.Popen(
-      cmd,
-      env=env,
-      cwd=cwd,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      text=True,
-    )
+def acquire_tmax_seat(wait_timeout_s=None, cancel=None):
+    seats = max_concurrent_seats()
+    if seats == 0:
+        raise SimulationError('TetraMAX pool is disabled (TMAX_MAX_CONCURRENT=0)')
+    path = lock_dir()
+    _pool(path, seats)
+    deadline = time.monotonic() + (acquire_timeout_s() if wait_timeout_s is None else wait_timeout_s)
+    fd = None
+    while fd is None:
+        if cancel is not None and cancel.is_set():
+            raise SimulationCancelled('TetraMAX request cancelled while queued')
+        if (path / 'DRAIN').exists():
+            raise SimulationError('TetraMAX pool is draining')
+        for slot in range(seats):
+            if (path / f'seat_{slot}.quarantined').exists():
+                continue
+            candidate = os.open(path / f'seat_{slot}.lock', os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(candidate)
+                continue
+            status = path / f'seat_{slot}.json'
+            if status.exists() and json.loads(status.read_text()).get('state') != 'IDLE':
+                (path / f'seat_{slot}.quarantined').write_text('Previous owner did not confirm process cleanup\n')
+                os.close(candidate)
+                continue
+            fd = candidate
+            break
+        if fd is None:
+            if time.monotonic() >= deadline:
+                raise SimulationError('Timed out waiting for a TetraMAX worker')
+            time.sleep(0.1)
     try:
-      stdout, stderr = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired as exc:
-      proc.kill()
-      proc.wait(timeout=30)
-      raise RuntimeError(
-        f"TetraMAX exceeded wall time ({timeout_s}s); process killed to release license."
-      ) from exc
-
-    if proc.returncode != 0:
-      raise subprocess.CalledProcessError(
-        proc.returncode, cmd, output=stdout, stderr=stderr
-      )
-    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        yield fd, path / f'seat_{slot}'
+    finally:
+        # Do not explicitly unlock: a surviving supervisor still owns the same
+        # open file description. Its inherited descriptor keeps the slot held.
+        os.close(fd)
 
 
-def detection_cache_key(netlist: str, input_vector: dict, fault: str) -> str:
-  import hashlib
-  import json as _json
+def run_tmax_subprocess(cmd, *, env, cwd, timeout_s=None, acquire_wait_s=None, cancel=None):
+    timeout_s = per_run_timeout_s() if timeout_s is None else timeout_s
+    started = time.monotonic()
+    with acquire_tmax_seat(acquire_wait_s, cancel) as (fd, state):
+        status = state.with_suffix('.json')
+        write_state(status, {'owner': os.getpid(), 'host': socket.gethostname(),
+                             'state': 'RUNNING', 'started': time.time()})
+        supervisor = [sys.executable, str(Path(__file__).with_name('tetramax_process.py')),
+                      json.dumps(cmd), str(timeout_s), str(status), str(os.getpid())]
+        try:
+            proc = subprocess.Popen(supervisor, env=env, cwd=cwd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, start_new_session=True, pass_fds=(fd,))
+        except OSError:
+            write_state(status, {'state': 'IDLE', 'spawn_failed': True})
+            raise
+        interrupted = None
+        stdout = stderr = ''
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise SimulationCancelled('TetraMAX request cancelled')
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException as exc:
+            interrupted = exc
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                state.with_suffix('.quarantined').write_text(f'Unconfirmed cleanup for supervisor {proc.pid}\n')
+                # Leave the supervisor alive with its inherited slot lock. A new
+                # process must not steal this reservation on uncertain cleanup.
+                raise SimulationError(f'TetraMAX cleanup unconfirmed; slot quarantined: {state}') from exc
+        finally:
+            if proc.poll() is not None:
+                # Only the watchdog can certify cleanup. SIGKILL/crashes must
+                # never turn an uncertain RUNNING reservation into an idle one.
+                final = json.loads(status.read_text())
+                if final.get('state') != 'IDLE':
+                    state.with_suffix('.quarantined').write_text('Supervisor did not certify cleanup\n')
+                    write_state(status, dict(final, state='QUARANTINED'))
+        if state.with_suffix('.quarantined').exists():
+            raise SimulationError(f'TetraMAX cleanup unconfirmed; slot quarantined: {state}')
+        if interrupted is not None:
+            raise interrupted
+        if proc.returncode == 124:
+            raise SimulationError(f'TetraMAX execution exceeded {timeout_s}s; supervised process group terminated')
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
-  iv_json = _json.dumps(input_vector, sort_keys=True)
-  h = hashlib.sha256()
-  h.update(netlist.encode("utf-8", errors="replace"))
-  h.update(b"\0")
-  h.update(iv_json.encode("utf-8"))
-  h.update(b"\0")
-  h.update(fault.encode("utf-8"))
-  return h.hexdigest()
+
+def detection_cache_key(netlist, input_vector, fault):
+    return hashlib.sha256(json.dumps([netlist, input_vector, fault], sort_keys=True).encode()).hexdigest()
 
 
 class TetraMaxDetectionCache:
-  """Simple in-process LRU for TetraMAX detected-fault lists."""
-
-  def __init__(self, maxsize: int):
-    self._maxsize = max(0, int(maxsize))
-    self._data: Dict[str, List[str]] = {}
-    self._order: List[str] = []
-
-  def get(self, key: str) -> Optional[List[str]]:
-    if key not in self._data:
-      return None
-    return list(self._data[key])
-
-  def set(self, key: str, detected: List[str]) -> None:
-    if self._maxsize <= 0:
-      return
-    if key in self._data:
-      self._order.remove(key)
-    elif len(self._order) >= self._maxsize:
-      old = self._order.pop(0)
-      self._data.pop(old, None)
-    self._data[key] = list(detected)
-    self._order.append(key)
+    def __init__(self, maxsize):
+        self.maxsize = maxsize
+        self.data = OrderedDict()
+        self.lock = threading.Lock()
+    def get(self, key):
+        with self.lock:
+            if key not in self.data:
+                return None
+            self.data.move_to_end(key)
+            return list(self.data[key])
+    def set(self, key, value):
+        if not self.maxsize:
+            return
+        with self.lock:
+            self.data[key] = list(value)
+            self.data.move_to_end(key)
+            while len(self.data) > self.maxsize:
+                self.data.popitem(last=False)
 
 
-_detection_cache: Optional[TetraMaxDetectionCache] = None
+_detection_cache = None
 
-
-def get_detection_cache() -> TetraMaxDetectionCache:
-  global _detection_cache
-  if _detection_cache is None:
-    _detection_cache = TetraMaxDetectionCache(result_cache_size())
-  return _detection_cache
+def get_detection_cache():
+    global _detection_cache
+    if _detection_cache is None:
+        _detection_cache = TetraMaxDetectionCache(result_cache_size())
+    return _detection_cache
