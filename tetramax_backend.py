@@ -51,6 +51,7 @@ class SimulationNetlist:
                     raise ValueError('Port direction missing')
                 declarations.append((kind, bounds, name))
         nets = {kind: [] for kind in ['input', 'output', 'inout', 'wire', 'reg']}
+        net_tokens = {}
         def indices(bounds):
             if not bounds:
                 return [None]
@@ -69,15 +70,41 @@ class SimulationNetlist:
                 name, unpacked = m.groups()
                 for u in indices(unpacked):
                     for p in indices(packed):
-                        nets[kind].append(name + ''.join(f'[{i}]' for i in (u,p) if i is not None))
+                        suffix = ''.join(f'[{i}]' for i in (u,p) if i is not None)
+                        nets[kind].append(name + suffix)
+                        net_tokens[name + suffix] = (name, suffix)
         if nets['inout'] or re.search(r'\b(always|initial)\b', clean):
             raise ValueError('Sequential, behavioral, and bidirectional designs are unsupported')
         self.input_nets, self.output_nets = nets['input'], nets['output']
         self.all_nets = list(dict.fromkeys(sum(nets.values(), [])))
         if not self.output_nets or len(set(self.input_nets + self.output_nets)) != len(self.input_nets + self.output_nets):
             raise ValueError('Missing or duplicate canonical ports')
-        if len({canonical(n) for n in self.all_nets}) != len(self.all_nets):
+        # An escaped literal identifier such as \\out[15] is distinct from bit
+        # 15 of the bus out. TetraMAX's textual net reports lose that distinction.
+        # Give only colliding escaped identifiers private names in the temporary
+        # simulator input, then translate results back to the original names.
+        groups = {}
+        for name in self.all_nets:
+            groups.setdefault(canonical(name), []).append(name)
+        rename_bases = {net_tokens[n][0] for group in groups.values() if len(group) > 1
+                        for n in group if n.startswith('\\')}
+        renames = {}
+        for base in sorted(rename_bases):
+            if re.fullmatch(r'[A-Za-z_]\w*', canonical(base)):
+                # Escaping a simple identifier does not make a different net.
+                raise ValueError('Duplicate escaped/simple net declaration')
+            replacement = '__atpg_net_' + hashlib.sha256(base.encode()).hexdigest()[:16]
+            while replacement in text or replacement in renames.values():
+                replacement += '_'
+            renames[base] = replacement
+        self.native_names = {n: renames.get(net_tokens[n][0], net_tokens[n][0]) + net_tokens[n][1]
+                             for n in self.all_nets}
+        if len({canonical(n) for n in self.native_names.values()}) != len(self.all_nets):
             raise ValueError('Ambiguous escaped/canonical net names')
+        # Match whole escaped tokens while leaving comments and strings intact.
+        self.native_netlist = re.sub(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\\\S+',
+                                     lambda m: renames.get(m[0], m[0]), text, flags=re.S)
+        self.native_top = renames.get(self.top, self.top)
 
 
 def assignment(value, names):
@@ -130,7 +157,9 @@ def _identity(request, binary, libraries):
     with _version_lock:
         if stamp not in _versions:
             try:
-                p = subprocess.run([binary, '-version'], capture_output=True, text=True, timeout=15)
+                # The site wrapper checks GUI prerequisites even for -version.
+                # Select shell mode explicitly for headless training jobs.
+                p = subprocess.run([binary, '-shell', '-version'], capture_output=True, text=True, timeout=15)
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise SimulationError(f'TetraMAX version preflight failed: {exc}') from exc
             if p.returncode or not re.search(r'[A-Z]-\d{4}\.\d{2}', p.stdout) or 'error while loading' in p.stderr:
@@ -256,13 +285,18 @@ def _run(request, model, binary, libraries, version, key, cancel):
     request_id = uuid.uuid4().hex
     started = time.monotonic()
     try:
-        (run/'design.v').write_text(model.netlist)
-        write_vector_stil(run/'vector.stil', model.input_nets, request['input_vector'], model.output_nets)
-        values = {'verilog_file': str(run/'design.v'), 'top_module': model.top,
-                  'stil_file': str(run/'vector.stil'), 'fault_net': request['fault_net'],
+        (run/'design.v').write_text(model.native_netlist)
+        native_inputs = [model.native_names[n] for n in model.input_nets]
+        native_outputs = [model.native_names[n] for n in model.output_nets]
+        native_vector = {model.native_names[n]:v for n,v in request['input_vector'].items()}
+        write_vector_stil(run/'vector.stil', native_inputs, native_vector, native_outputs)
+        native_fault = (model.native_names[request['fault_net']] if request['fault_kind'] == 'net'
+                        else request['fault_net'])
+        values = {'verilog_file': str(run/'design.v'), 'top_module': model.native_top,
+                  'stil_file': str(run/'vector.stil'), 'fault_net': native_fault,
                   'fault_kind': request['fault_kind'], 'stuck_at': request['stuck_at'], 'request_id': request_id}
         manifest = '\n'.join(f'set {k} {tcl_word(v)}' for k,v in values.items())
-        for name, entries in [('cell_libraries',libraries),('po_names',model.output_nets)]:
+        for name, entries in [('cell_libraries',libraries),('po_names',native_outputs)]:
             manifest += '\nset '+name+' [list '+' '.join(tcl_word(v) for v in entries)+']'
         (run/'request.tcl').write_text(manifest+'\n')
         env = os.environ.copy()
@@ -281,10 +315,12 @@ def _run(request, model, binary, libraries, version, key, cancel):
         if 'Fault simulation completed:' not in (run/'fault_simulation.log').read_text():
             raise SimulationError('Fault simulation did not complete')
         native = fields['fault_status']
-        allowed = {'DS','NC','ND','AU','AN','AP','NP','PT','UU','UT','UB','UR','UC','UO','RE'}
+        # NO (not observed) is a normal non-detection: the fault effect did not
+        # reach an observed output. See the TetraMAX Fault Class Summary.
+        allowed = {'DS','NC','NO','ND','AU','AN','AP','NP','PT','UU','UT','UB','UR','UC','UO','RE'}
         if native not in allowed:
             raise SimulationError(f'Unsupported native fault status {native!r}')
-        names = {canonical(n):n for n in model.all_nets}
+        names = {canonical(native):original for original,native in model.native_names.items()}
         snapshot = {}
         for line in (run/'values.tsv').read_text().splitlines():
             n,g,b = line.split('\t')
@@ -312,7 +348,15 @@ def _run(request, model, binary, libraries, version, key, cancel):
         if isinstance(exc, subprocess.CalledProcessError):
             (run/'stdout.log').write_text(exc.stdout or '')
             (run/'stderr.log').write_text(exc.stderr or '')
-        raise SimulationError(f'TetraMAX request failed; diagnostics: {run}: {exc}') from exc
+        detail = str(exc)
+        try:
+            # Include Tcl's cause in the service response, not just exit status.
+            message = (run/'error.txt').read_text().strip()
+            if message:
+                detail = message[:2000]
+        except OSError:
+            pass
+        raise SimulationError(f'TetraMAX request failed; diagnostics: {run}: {detail}') from exc
     except SimulationError as exc:
         raise type(exc)(f'{exc}; diagnostics: {run}') from exc
     finally:

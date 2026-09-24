@@ -13,6 +13,14 @@ proc value_pair {data} {
     if {$bad eq ""} { set bad $good }
     return [list $good $bad]
 }
+proc register_driver {map_name net path} {
+    upvar 1 $map_name drivers
+    if {$net eq ""} { return }
+    if {[dict exists $drivers $net] && [dict get $drivers $net] ne $path} {
+        error "Multiple native drivers for net $net"
+    }
+    dict set drivers $net $path
+}
 proc export_values {file_name} {
     set f [open $file_name w]
     foreach_in_collection pin [get_pins] {
@@ -42,25 +50,48 @@ if {[catch {
     set_patterns -external $stil_file -sensitive
     # Map a net stem to its unique native driver, never to a sink branch.
     set drivers [dict create]
+    set gate_drivers [dict create]
     set pins [dict create]
     foreach_in_collection pin [get_pins] {
         set path [get_attribute $pin pin_pathname]
         dict set pins [canonical $path] $path
-        set kind [get_attribute [get_attribute $pin gate] cell_type]
+        set gate [get_attribute $pin gate]
+        set kind [get_attribute $gate cell_type]
         if {[get_attribute $pin direction] ne "OUT" || $kind eq "PO"} { continue }
+        register_driver gate_drivers [get_attribute $gate cell_id] $path
         set net [canonical [get_attribute $pin net_name]]
-        if {$kind eq "PI"} { set net [canonical $path] }
-        if {$net eq ""} { continue }
-        if {[dict exists $drivers $net] && [dict get $drivers $net] ne $path} {
-            error "Multiple native drivers for net $net"
+        register_driver drivers $net $path
+        if {$kind eq "PI"} {
+            register_driver drivers [canonical $path] $path
         }
-        dict set drivers $net $path
+    }
+    # A direct assign can give a PO a different name from its native net
+    # (e.g. assign gray_decode[7] = gray[7]). Resolve through native connectivity
+    # to the stem driver; injecting on the PO would only fault that branch.
+    foreach_in_collection pin [get_pins] {
+        set gate [get_attribute $pin gate]
+        set kind [get_attribute $gate cell_type]
+        if {$kind ne "PO"} { continue }
+        # PI/PO primitives have empty net_name in O-2018.06. Use the PO's
+        # immediate native fanin, not transitive PI fanin or a guessed net name.
+        set sources [get_attribute $gate fanin_gates]
+        if {[sizeof_collection $sources] != 1} {
+            error "Expected one native driver for output [get_attribute $pin pin_pathname]"
+        }
+        foreach_in_collection source $sources {
+            set source_id [get_attribute $source cell_id]
+            # A PI cell's `pins` collection can be empty even though get_pins
+            # exposes its output. Use the output indexed in the first pass.
+            if {[dict exists $gate_drivers $source_id]} {
+                register_driver drivers [canonical [get_attribute $pin pin_pathname]] [dict get $gate_drivers $source_id]
+            }
+        }
     }
     set target [canonical $fault_net]
-    if {[dict exists $drivers $target]} {
-        set fault_pin [dict get $drivers $target]
-    } elseif {$fault_kind eq "pin" && [dict exists $pins $target]} {
+    if {$fault_kind eq "pin" && [dict exists $pins $target]} {
         set fault_pin [dict get $pins $target]
+    } elseif {$fault_kind eq "net" && [dict exists $drivers $target]} {
+        set fault_pin [dict get $drivers $target]
     } else { error "No unique native driver for requested $fault_kind fault $fault_net" }
     set_faults -model stuck -report uncollapsed
     remove_faults -all

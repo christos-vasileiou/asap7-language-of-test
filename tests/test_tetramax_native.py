@@ -44,6 +44,74 @@ def test_native_stem_vs_branch(native):
     assert branch['values']['z']==[0,0]  # Other fanout is unaffected.
 
 
+@pytest.mark.parametrize('driver', ['pi', 'cell'])
+def test_native_assigned_output_uses_stem_driver(native, driver):
+    if driver == 'pi':
+        design = 'module design(input a,output y,output z); assign y=a; BUF U1(.A(a),.Y(z)); endmodule'
+        expected_driver = 'a'
+    else:
+        design = 'module design(input a,output y,output z); wire n; BUF U0(.A(a),.Y(n)); assign y=n; BUF U1(.A(n),.Y(z)); endmodule'
+        expected_driver = 'U0/Y'
+    result = native(design, {'a':1}, {'y':0,'z':0}, 'sa0 y')
+    assert result['detected'] and result['native_fault'] == expected_driver
+    # Both fanouts must see the fault, not only the aliased primary output.
+    assert result['values']['y'] == [1,0]
+    assert result['values']['z'] == [1,0]
+    negative = native(design, {'a':0}, {'y':0,'z':0}, 'sa0 y')
+    assert not negative['detected']
+
+
+def test_native_recorded_gray_decode_alias(monkeypatch):
+    monkeypatch.delenv('CELL_LIBS_VERILOG', raising=False)
+    monkeypatch.delenv('TMAX_SERVER_URL', raising=False)
+    monkeypatch.delenv('TMAX_SERVER_FILE', raising=False)
+    design = (Path(__file__).parent / 'fixtures/tetramax_gray_decode.v').read_text()
+    inputs = {f'gray[{i}]':int(value) for i,value in enumerate('10101010')}
+    outputs = {f'gray_decode[{i}]':0 for i in range(8)}
+    result = simulate(make_request(design, inputs, outputs, 'sa1 gray_decode[7]'))
+    assert result['detected'] and result['native_fault'] == 'gray[7]'
+    expected_good = [0,1,1,0,0,1,1,0]
+    for i,good in enumerate(expected_good):
+        assert result['values'][f'gray_decode[{i}]'] == [good,1-good]
+
+
+def test_native_escaped_wire_and_bus_bit_stay_distinct(native):
+    design = r'''module design(input a,input b,output [0:0] y,output z);
+wire \y[0] ;
+BUF U0(.A(a),.Y(y[0]));
+BUF U1(.A(b),.Y(\y[0] ));
+BUF U2(.A(\y[0] ),.Y(z));
+endmodule'''
+    vector = {'a':1,'b':0}
+    outputs = {'y[0]':0,'z':0}
+    bit_fault = native(design, vector, outputs, 'sa0 y[0]')
+    assert bit_fault['detected'] and bit_fault['native_fault'] == 'U0/Y'
+    assert bit_fault['values']['y[0]'] == [1,0]
+    assert bit_fault['values'][r'\y[0]'] == [0,0]
+    assert bit_fault['values']['z'] == [0,0]
+    literal_fault = native(design, vector, outputs, r'sa1 \y[0]')
+    assert literal_fault['detected'] and literal_fault['native_fault'] == 'U1/Y'
+    assert literal_fault['values']['y[0]'] == [1,1]
+    assert literal_fault['values'][r'\y[0]'] == [0,1]
+    assert literal_fault['values']['z'] == [0,1]
+
+
+def test_native_neuron_ram_escaped_net(monkeypatch):
+    from tetramax_backend import SimulationNetlist
+    monkeypatch.delenv('CELL_LIBS_VERILOG', raising=False)
+    monkeypatch.delenv('TMAX_SERVER_URL', raising=False)
+    monkeypatch.delenv('TMAX_SERVER_FILE', raising=False)
+    design = (Path(__file__).parent/'fixtures/tetramax_neuron_ram.v').read_text()
+    model = SimulationNetlist(design)
+    inputs = dict.fromkeys(model.input_nets, 0)
+    outputs = dict.fromkeys(model.output_nets, 0)
+    for fault in ('sa1 weights_out[15]', r'sa1 \weights_out[15]'):
+        result = simulate(make_request(design, inputs, outputs, fault))
+        assert result['detected'] and result['native_fault'] == 'U5/L'
+        assert all(result['values'][f'weights_out[{i}]'] == [0,1] for i in range(16))
+        assert result['values']['loaded'] == [1,1]
+
+
 def test_native_bus_order_and_escaped_net(native):
     design=r'''module actual_top(input [1:0] a, output [0:1] y);
 wire \odd$name ;

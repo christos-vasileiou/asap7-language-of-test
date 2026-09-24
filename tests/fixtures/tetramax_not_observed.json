@@ -1,0 +1,7 @@
+{
+  "design.v": "module demux_1_to_4 ( a, b, c, d, din, s0, s1 );\ninput din, s0, s1;\noutput a, b, c, d;\nwire   n4, n5;\nINVxp33_ASAP7_75t_R U8 ( .A(din), .Y(n4) );\nINVxp33_ASAP7_75t_R U9 ( .A(s0), .Y(n5) );\nNOR3xp33_ASAP7_75t_R U10 ( .A(s1), .B(n4), .C(n5), .Y(b) );\nNOR3xp33_ASAP7_75t_R U11 ( .A(s1), .B(s0), .C(n4), .Y(a) );\nAND3x1_ASAP7_75t_R U12 ( .A(s1), .B(din), .C(s0), .Y(d) );\nAND3x1_ASAP7_75t_R U13 ( .A(din), .B(s1), .C(n5), .Y(c) );\nendmodule",
+  "good_simulation.log": " Begin good simulation of 1 external patterns.\n Simulation completed: #patterns=1, #fail_pats=0(0), #failing_meas=0(0), #rejected_pats=0, CPU time=0.00\n",
+  "fault_simulation.log": " Simulation performed for 1 faults on circuit size of 13 gates.\n --------------------------------------------\n #patterns     #faults     test      process\n simulated  detect/active  coverage  CPU time\n ---------  -------------  --------  --------\n Fault simulation completed: #patterns=1, CPU time=0.00\n",
+  "values.tsv": "din\t0\t0\ns0\t0\t0\ns1\t1\t0\nn4\t1\t1\nn5\t1\t1\nb\t0\t0\na\t0\t0\nd\t0\t0\nc\t0\t0\na\t0\t0\nb\t0\t0\nc\t0\t0\nd\t0\t0\n",
+  "result.tsv": "fault_pin\ts1\nfault_status\tNO\ncomplete\t7e6648e08144409fa2c984fb45e62ae9\n"
+}

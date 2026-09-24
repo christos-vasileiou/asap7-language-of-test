@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,6 +43,33 @@ def test_metadata_and_vectors():
     assert first == second  # Model output claims never determine simulation.
 
 
+def test_escaped_literal_is_distinct_from_bus_bit():
+    design = (Path(__file__).parent/'fixtures/tetramax_neuron_ram.v').read_text()
+    model = backend.SimulationNetlist(design)
+    literal = r'\weights_out[15]'
+    bit = 'weights_out[15]'
+    assert literal in model.all_nets and bit in model.output_nets
+    assert model.native_names[literal] != model.native_names[bit]
+    assert model.native_names[bit] == bit
+    assert model.netlist == design
+    assert f'assign {bit} = {model.native_names[literal]} ;' in model.native_netlist
+    inputs = dict.fromkeys(model.input_nets, 0)
+    outputs = dict.fromkeys(model.output_nets, 0)
+    for target in (literal, bit):
+        assert backend.make_request(design, inputs, outputs, 'sa1 '+target)['fault_net'] == target
+
+
+def test_private_net_names_avoid_existing_names_and_preserve_comments():
+    design = 'module d(input a, output [0:0] y); wire \\y[0] ; assign \\y[0] = a; assign y[0] = \\y[0] ; endmodule'
+    first = backend.SimulationNetlist(design)
+    reserved = first.native_names[r'\y[0]']
+    design = design.replace('endmodule', f'wire {reserved}; // \\y[0] stays in this comment\nendmodule')
+    model = backend.SimulationNetlist(design)
+    assert model.native_names[r'\y[0]'] != reserved
+    assert '// \\y[0] stays in this comment' in model.native_netlist
+    assert len(set(map(backend.canonical, model.native_names.values()))) == len(model.all_nets)
+
+
 def test_strict_selection_without_binary(monkeypatch):
     import fault_sim
     monkeypatch.setenv('FAULT_SIM_BACKEND','tetramax')
@@ -53,6 +81,57 @@ def test_strict_selection_without_binary(monkeypatch):
     monkeypatch.setenv('FAULT_SIM_BACKEND','typo')
     with pytest.raises(ValueError):
         fault_sim.resolve_fault_sim_runner()
+
+
+def test_version_preflight_without_display(tmp_path, monkeypatch):
+    monkeypatch.delenv('DISPLAY', raising=False)
+    binary = tmp_path / 'tmax'
+    binary.write_text(f'#!{sys.executable}\n' + '''
+import os
+import sys
+if '-shell' not in sys.argv and not os.environ.get('DISPLAY'):
+    sys.exit('ERROR: DISPLAY variable was not set')
+if '-version' not in sys.argv:
+    sys.exit('Expected a version-only probe')
+print('TetraMAX O-2018.06-SP1')
+''')
+    binary.chmod(0o755)
+    fingerprint, version = backend._identity({}, str(binary), [])
+    assert version == 'TetraMAX O-2018.06-SP1'
+    assert len(fingerprint) == 64
+
+
+@pytest.mark.parametrize('status', ['NO', 'INVALID'])
+def test_recorded_not_observed_result(pool, monkeypatch, status):
+    # Replay the actual demux_1_to_4 simulation that aborted the initial eval.
+    # No simulator executable or license is used by this regression test.
+    fixture = json.loads((Path(__file__).parent / 'fixtures/tetramax_not_observed.json').read_text())
+    recorded_id = dict(line.split('\t') for line in fixture['result.tsv'].splitlines())['complete']
+    monkeypatch.setattr(backend.uuid, 'uuid4', lambda: SimpleNamespace(hex=recorded_id))
+    request = backend.make_request(fixture['design.v'], {'din':0, 's0':0, 's1':1},
+                                   {'a':0, 'b':0, 'c':0, 'd':0}, 'sa0 s1')
+    model = backend.SimulationNetlist(request['netlist'])
+
+    def replay(command, *, env, cwd, cancel):
+        for name, content in fixture.items():
+            if name == 'result.tsv':
+                content = content.replace('fault_status\tNO', 'fault_status\t' + status)
+            (Path(cwd) / name).write_text(content)
+        (Path(cwd) / 'licenses.log').write_text('test fixture\n')
+        return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
+
+    monkeypatch.setattr(backend, 'run_tmax_subprocess', replay)
+    if status == 'INVALID':
+        with pytest.raises(seats.SimulationError, match='Unsupported native fault status'):
+            backend._run(request, model, 'test-tmax', [], 'O-2018.06-SP1', 'test-key', None)
+        return
+    result = backend._run(request, model, 'test-tmax', [], 'O-2018.06-SP1', 'test-key', None)
+    assert result['status'] == 'ok'
+    assert result['fault_status'] == 'NO'
+    assert result['detected'] is False
+    assert result['indeterminate'] is False
+    assert result['values']['s1'] == [1, 0]  # Activated, but blocked at the outputs.
+    assert all(result['values'][po] == [0, 0] for po in result['outputs'])
 
 
 def test_pool_limit_disabled_conflict_and_drain(pool, monkeypatch):
@@ -74,6 +153,18 @@ def test_pool_limit_disabled_conflict_and_drain(pool, monkeypatch):
     with pytest.raises(seats.SimulationError, match='draining'):
         with seats.acquire_tmax_seat(0):
             pass
+
+
+def test_tcl_error_survives_service_exception(pool, monkeypatch):
+    request = backend.make_request(DESIGN, {'a':1,'b':1}, {'y':0,'z':0}, 'sa0 n')
+    def fail(command, *, env, cwd, cancel):
+        (Path(cwd)/'error.txt').write_text('No unique native driver for requested net fault n\n')
+        raise subprocess.CalledProcessError(1, command, output='simulator output', stderr='simulator error')
+    monkeypatch.setattr(backend, 'run_tmax_subprocess', fail)
+    with pytest.raises(seats.SimulationError, match='No unique native driver for requested net fault n') as caught:
+        backend._run(request, backend.SimulationNetlist(DESIGN), 'test-tmax', [], 'test-version', 'test-key', None)
+    assert 'diagnostics:' in str(caught.value)
+    assert next((pool/'runs').glob('request_*/stderr.log')).read_text() == 'simulator error'
 
 
 def test_supervised_exit_timeout_cancel(pool):
