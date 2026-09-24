@@ -26,6 +26,13 @@ import uuid
 from tetramax_seats import SimulationError, SimulationCancelled, lock_dir, _pool, acquire_timeout_s, per_run_timeout_s, max_concurrent_seats
 
 
+class TetraMaxHTTPServer(ThreadingHTTPServer):
+    # DDP ranks submit and poll concurrently (16 reward threads per rank).
+    # The default backlog of five drops bursts before JobPool sees them.
+    # This is connection capacity, not simulator/license concurrency.
+    request_queue_size = 256
+
+
 class JobPool:
     def __init__(self, workers, capacity, runner=None):
         from tetramax_backend import simulate
@@ -238,7 +245,7 @@ def main():
         simulator = {'schema':VERSION, 'fingerprint':fingerprint, 'tool_version':version}
         pool=JobPool(args.workers,args.queue_size)
         token=secrets.token_urlsafe(32)
-        server=ThreadingHTTPServer((args.host,args.port),handler(pool,token,simulator))
+        server=TetraMaxHTTPServer((args.host,args.port),handler(pool,token,simulator))
         advertised = args.advertise_host or ('127.0.0.1' if args.host == '127.0.0.1' else socket.gethostname())
         path=root/'server.json'
         temporary = root/('.server-'+uuid.uuid4().hex)

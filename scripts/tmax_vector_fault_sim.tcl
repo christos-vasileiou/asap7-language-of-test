@@ -22,7 +22,9 @@ proc register_driver {map_name net path} {
     dict set drivers $net $path
 }
 proc export_values {file_name} {
+    global net_aliases drivers
     set f [open $file_name w]
+    set path_values [dict create]
     foreach_in_collection pin [get_pins] {
         set net [canonical [get_attribute $pin net_name]]
         set path [get_attribute $pin pin_pathname]
@@ -30,7 +32,18 @@ proc export_values {file_name} {
         if {$type eq "PI" || $type eq "PO"} { set net [canonical $path] }
         if {$net eq "" || [get_attribute $pin direction] ne "OUT"} { continue }
         set pair [value_pair [get_attribute $pin pin_data]]
+        dict set path_values $path $pair
         puts $f "$net\t[lindex $pair 0]\t[lindex $pair 1]"
+    }
+    foreach group $net_aliases {
+        foreach alias $group {
+            set name [canonical $alias]
+            if {![dict exists $drivers $name]} { continue }
+            set path [dict get $drivers $name]
+            if {![dict exists $path_values $path]} { continue }
+            set pair [dict get $path_values $path]
+            puts $f "$name\t[lindex $pair 0]\t[lindex $pair 1]"
+        }
     }
     close $f
 }
@@ -84,6 +97,23 @@ if {[catch {
             # exposes its output. Use the output indexed in the first pass.
             if {[dict exists $gate_drivers $source_id]} {
                 register_driver drivers [canonical [get_attribute $pin pin_pathname]] [dict get $gate_drivers $source_id]
+            }
+        }
+    }
+    # Direct internal assigns may disappear from every native pin net_name.
+    # Restore their names using declared wire equivalences, but require a
+    # single driver actually found in the native model for the entire group.
+    foreach group $net_aliases {
+        set paths [list]
+        foreach alias $group {
+            set name [canonical $alias]
+            if {[dict exists $drivers $name]} { lappend paths [dict get $drivers $name] }
+        }
+        set paths [lsort -unique $paths]
+        if {[llength $paths] > 1} { error "Conflicting native drivers for wire aliases $group" }
+        if {[llength $paths] == 1} {
+            foreach alias $group {
+                register_driver drivers [canonical $alias] [lindex $paths 0]
             }
         }
     }

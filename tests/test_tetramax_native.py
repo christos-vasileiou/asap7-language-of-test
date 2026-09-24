@@ -75,6 +75,53 @@ def test_native_recorded_gray_decode_alias(monkeypatch):
         assert result['values'][f'gray_decode[{i}]'] == [good,1-good]
 
 
+@pytest.mark.parametrize('driver', ['pi', 'cell'])
+def test_native_internal_alias_chain_faults_entire_stem(native, driver):
+    prefix = 'assign source=a;' if driver == 'pi' else 'BUF U0(.A(a),.Y(source));'
+    design = ('module design(input a,output y,output z); wire source,alias1,alias2; '
+              + prefix + ' assign alias2=alias1; assign alias1=source; '
+              'BUF U1(.A(alias2),.Y(y)); BUF U2(.A(source),.Y(z)); endmodule')
+    for bit in (0, 1):
+        result = native(design, {'a':bit}, {'y':0, 'z':0}, 'sa0 alias2')
+        assert result['native_fault'] == ('a' if driver == 'pi' else 'U0/Y')
+        assert result['detected'] == bool(bit)
+        for name in ('source', 'alias1', 'alias2', 'y', 'z'):
+            assert result['values'][name] == [bit, 0]
+
+
+def test_native_recorded_alu_decoder_internal_alias(monkeypatch):
+    from tetramax_backend import SimulationNetlist
+    monkeypatch.delenv('CELL_LIBS_VERILOG', raising=False)
+    monkeypatch.delenv('TMAX_SERVER_URL', raising=False)
+    monkeypatch.delenv('TMAX_SERVER_FILE', raising=False)
+    design = (Path(__file__).parent/'fixtures/tetramax_alu_decoder.v').read_text()
+    model = SimulationNetlist(design)
+    # Exact pattern and fault saved from the failed training tool call.
+    inputs = {f'inst[{i}]': int(bit) for i, bit in enumerate('10100000000000100000000000000000')}
+    outputs = dict.fromkeys(model.output_nets, 0)
+    result = simulate(make_request(design, inputs, outputs, 'sa1 inst_13'))
+    reference = simulate(make_request(design, inputs, outputs, 'sa1 inst[13]'))
+    assert result['native_fault'] == 'inst[13]'
+    assert result['values']['inst_13'] == [0, 1]
+    assert result['values'] == reference['values']
+    assert result['fault_status'] == reference['fault_status']
+    # Compare all four aliases with their explicit PI targets, including both
+    # stuck polarities and activated/non-activated patterns.
+    for bit in (0, 1):
+        inputs = dict.fromkeys(model.input_nets, bit)
+        outputs = dict.fromkeys(model.output_nets, 0)
+        for index in (12, 13, 14, 30):
+            for stuck in (0, 1):
+                alias = f'inst_{index}'
+                source = f'inst[{index}]'
+                result = simulate(make_request(design, inputs, outputs, f'sa{stuck} {alias}'))
+                reference = simulate(make_request(design, inputs, outputs, f'sa{stuck} {source}'))
+                assert result['native_fault'] == source
+                assert result['values'][alias] == result['values'][source] == [bit, stuck]
+                assert result['values'] == reference['values']
+                assert result['fault_status'] == reference['fault_status']
+
+
 def test_native_escaped_wire_and_bus_bit_stay_distinct(native):
     design = r'''module design(input a,input b,output [0:0] y,output z);
 wire \y[0] ;

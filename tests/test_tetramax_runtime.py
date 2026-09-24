@@ -70,6 +70,24 @@ def test_private_net_names_avoid_existing_names_and_preserve_comments():
     assert len(set(map(backend.canonical, model.native_names.values()))) == len(model.all_nets)
 
 
+def test_scalar_alias_groups_exclude_logic_constants_and_distinct_escaped_nets():
+    design = r'''module d(input [1:0] a, output y);
+wire first, last, inverted, tied, \a[0] ;
+assign last = first;
+assign first = a[0];
+assign inverted = ~a[0];
+assign tied = 1'b0;
+// assign inverted = first;
+/* assign tied = first; */
+BUF U0(.A(last),.Y(y));
+BUF U1(.A(a[1]),.Y(\a[0] ));
+endmodule'''
+    model = backend.SimulationNetlist(design)
+    assert len(model.net_aliases) == 1
+    assert set(model.net_aliases[0]) == {'first', 'last', 'a[0]'}
+    assert model.native_names[r'\a[0]'] != model.native_names['a[0]']
+
+
 def test_strict_selection_without_binary(monkeypatch):
     import fault_sim
     monkeypatch.setenv('FAULT_SIM_BACKEND','tetramax')
@@ -257,6 +275,35 @@ def test_service_bounded_cancel_idempotency():
     finally:
         service.close()
     assert service.poll('a'*32)['error_type']=='infrastructure'
+
+
+def test_service_handles_two_rank_reward_bursts(monkeypatch):
+    """Exercise the HTTP boundary, not just the simulator worker queue."""
+    from tetramax_service import TetraMaxHTTPServer, handler, remote_simulate
+    service = JobPool(16, 128, lambda payload, cancel: payload)
+    server = TetraMaxHTTPServer(('127.0.0.1', 0), handler(service, 'test-token'))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.delenv('TMAX_SERVER_FILE', raising=False)
+    monkeypatch.setenv('TMAX_SERVER_URL', f'http://127.0.0.1:{server.server_port}')
+    monkeypatch.setenv('TMAX_SERVER_TOKEN', 'test-token')
+    barrier = threading.Barrier(32)
+
+    def client(index):
+        barrier.wait(timeout=30)
+        return remote_simulate({'index': index})
+
+    try:
+        # Two ranks with sixteen reward workers each, repeated for a full
+        # candidate batch. A five-connection backlog loses these bursts.
+        with ThreadPoolExecutor(32) as executor:
+            results = list(executor.map(client, range(256)))
+        assert results == [{'index': i} for i in range(256)]
+    finally:
+        server.shutdown()
+        server.server_close()
+        service.close()
+        thread.join(timeout=5)
 
 
 def test_reconfiguration_requires_proven_cleanup(pool):

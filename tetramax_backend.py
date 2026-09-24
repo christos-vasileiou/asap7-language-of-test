@@ -105,6 +105,23 @@ class SimulationNetlist:
         self.native_netlist = re.sub(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\\\S+',
                                      lambda m: renames.get(m[0], m[0]), text, flags=re.S)
         self.native_top = renames.get(self.top, self.top)
+        # Preserve scalar wire aliases that native model building can erase.
+        # Only direct connections between declared single-bit nets qualify;
+        # constants, expressions and whole buses are not inferred here.
+        parents = {n: n for n in self.all_nets}
+        def root(n):
+            while parents[n] != n:
+                parents[n] = parents[parents[n]]
+                n = parents[n]
+            return n
+        for left, right in re.findall(r'\bassign\s+([^;=]+)=([^;]+);', clean):
+            left, right = left.strip(), right.strip()
+            if left in parents and right in parents:
+                parents[root(left)] = root(right)
+        aliases = {}
+        for net in self.all_nets:
+            aliases.setdefault(root(net), []).append(net)
+        self.net_aliases = [group for group in aliases.values() if len(group) > 1]
 
 
 def assignment(value, names):
@@ -298,6 +315,9 @@ def _run(request, model, binary, libraries, version, key, cancel):
         manifest = '\n'.join(f'set {k} {tcl_word(v)}' for k,v in values.items())
         for name, entries in [('cell_libraries',libraries),('po_names',native_outputs)]:
             manifest += '\nset '+name+' [list '+' '.join(tcl_word(v) for v in entries)+']'
+        manifest += '\nset net_aliases [list ' + ' '.join(
+            '[list ' + ' '.join(tcl_word(model.native_names[n]) for n in group) + ']'
+            for group in model.net_aliases) + ']'
         (run/'request.tcl').write_text(manifest+'\n')
         env = os.environ.copy()
         env['REQUEST_FILE'] = str(run/'request.tcl')
